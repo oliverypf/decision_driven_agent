@@ -1,0 +1,89 @@
+# Decision-Driven Agent
+
+Phase 2 of the Decision-Driven Codex Agent design. Phase 1 is complete and the current work extends the decision layer with second-stage routing capabilities. The package is dependency-free and exposes JSON-compatible components for hook integration:
+
+- `EvidenceStore`: append-only JSONL evidence persistence with enforced retention. Mandatory evidence
+  (requirements, acceptance criteria, diffs, test results, build failures, security risks, user requests,
+  decisions and final acceptance) is always kept, `error`/`warning` records are never dropped, oversized
+  logs and runtime records are compressed at write time, and an explicit `DROP` is honored only for
+  non-mandatory records (the returned record reports `retention=drop` and `metadata.dropped`).
+- `EvidenceSufficiencyJudge`: checks implementation, acceptance coverage, validation evidence, and unresolved failures.
+- `StopJudge`: asks JEV whether the goal is complete, applies a JEV-selected task-domain gate, and returns `stop`, `continue`, or `escalate`.
+- `FailureRouter`: submits failure evidence to JEV and adopts the returned failure type; local rules run only as a marked safety fallback when JEV is unavailable or its answer is invalid.
+
+## Run tests
+
+```powershell
+python -m unittest discover -s tests -v
+```
+
+## Hook-friendly CLI
+
+The CLI accepts a JSON object from a file or stdin and prints a JSON decision:
+
+```powershell
+Get-Content .\stop-input.json | python -m decision_agent stop -
+python -m decision_agent sufficiency .\sufficiency-input.json
+python -m decision_agent failure-route .\failure-input.json
+python -m decision_agent tool-risk .\tool-risk-input.json
+```
+
+The stop and sufficiency payloads accept `requirement`, `acceptance_criteria`, `evidence`, and an optional `domain`. Supported domains are `implementation`, `documentation`, `information`, `investigation`, `configuration`, `external_action`, and `unknown`. Evidence records may include `metadata.criterion_ids` to associate validation with a specific acceptance criterion. The failure route payload maps to `FailureInput` fields: `message`, `stack_trace`, `environment`, `recent_diff`, `exit_code`, and `test_name`.
+
+Failure routing is JEV-driven: the route output carries `source` (`JEV` or `local_fallback`), `fallback`, `fallback_reason` and the per-type JEV scores, and every JEV call is recorded in the evidence store with its call status, submission digest, adopted output and error. A `local_fallback` result is never presented as a JEV conclusion.
+
+Tool-risk payloads accept `tool_name`, `tool_input`, an optional `requirement` and an optional `domain`. The result carries the risk level, the tool-appropriateness verdict, the recommendation (`proceed`, `confirm` or `block`) and the same `source`/`fallback`/`fallback_reason` markers as the other JEV-backed decisions.
+
+## Codex project hooks
+
+The repository includes a project-level `.codex/hooks.json` and a Windows-compatible hook entrypoint. It connects the decision layer to:
+
+- `UserPromptSubmit`: starts a task evidence store and records the requirement.
+- `PreToolUse`: asks JEV to judge a planned tool call (risk level and tool appropriateness) before it runs. Read-only calls, validation commands, dedicated file-edit tools and unambiguously destructive commands are decided by a local pre-screen; only the deterministic destructive verdict denies the call, and JEV verdicts stay advisory. Every judgment is recorded in the evidence store, and a high-risk verdict is additionally stored as security-risk evidence.
+- `PostToolUse`: records tool input/output, diffs, tests, runtime checks and build failures. A local pre-screen classifies high-confidence results without a model call; weak or unclassified failures are escalated to JEV in a single call that resolves the evidence kind, the failure status and the failure type.
+- `Stop`: asks JEV to judge goal completion first, then applies the domain-specific completion contract; it blocks missing goal/domain evidence and escalates after the iteration limit. The decision carries `source`, `fallback` and `fallback_reason`, so a local safety fallback is never presented as a JEV conclusion.
+
+The evidence path is `.decision/evidence/<session>/<turn>/evidence.jsonl`; session state is stored under `.decision/sessions/`. A new user turn gets a new evidence store even when Codex keeps the same conversation session.
+
+A turn whose prompt is only an acknowledgement (`要`, `继续`, `ok`, `do it`, ...) does not restate the goal.
+The hook still records the raw reply as `user_request` evidence, but the effective requirement for the turn
+carries the most recent informative requirement forward - the previous turn's requirement, the newest
+session `decision-space.json` goal, or the newest informative requirement record - and marks it with
+`metadata.requirement_source` and `metadata.carried_from`. The Stop hook applies the same fallback and
+prefers the packet goal the reasoning model wrote for the turn, so JEV judges the real task instead of a
+bare acknowledgement. Running `decision_route.py` also writes the packet goal back as `requirement`
+evidence with `metadata.source="decision_route"`.
+
+To activate the project hook in Codex, open this project and review/trust the unmanaged hook when prompted, or use `/hooks` in Codex. For a one-off CLI run outside the trusted project flow, Codex supports `--dangerously-bypass-hook-trust`; only use that when the hook source has been reviewed.
+
+When `OPENROUTER_API_KEY` is configured, the Stop hook makes two JEV decisions: goal completion/domain classification, followed by a domain-specific stop gate. Information and investigation tasks can complete with an answer or supported finding without a git diff or tests; implementation and configuration tasks still require the evidence appropriate to those domains. Local code only validates the response shape and enforces hard safety constraints such as the iteration limit. If JEV is unavailable, times out or returns an invalid answer, the hook records `source="local_fallback"` with the failure reason and falls back to a domain-aware conservative decision rather than presenting the local result as a JEV conclusion. Each hook passes an explicit per-call JEV timeout budget (Stop 18s per decision, PostToolUse 10s, PreToolUse 8s) so a slow model call degrades to the marked fallback instead of the hook being killed.
+
+## Efficiency routers
+
+The repository includes first-pass routing decisions for reducing wasted model and tool calls:
+
+- `ModelRouter`: choose between model candidates.
+- `ToolRouter`: choose between tool candidates.
+- `TestSelector`: choose which tests or validation commands to run.
+- `MemoryDecision`: choose whether context or evidence candidates should be kept and reused.
+
+Each router returns a structured `RoutingDecision` with the chosen candidate, confidence, reason, candidate scores and explicit `source`/`fallback` markers. JEV remains the decision authority when available; a local decision is only selected as an explicitly marked `local_fallback` when JEV is unavailable or its response is invalid. `DecisionController` exposes them as `route_model`, `route_tool`, `select_tests` and `decide_memory`.
+
+## Observation metrics
+
+`python -m decision_agent metrics [PATH]` aggregates the observation metrics from persisted evidence
+(`.decision/evidence` by default; a single `evidence.jsonl`, one store directory, or a whole evidence root
+all work). The report carries per-task entries plus project totals:
+
+- `usable_call_ratio`: attempted JEV calls whose answer was adopted, divided by all attempted calls.
+- `calls_invalid` / `calls_duplicate`: attempted calls that were not adopted, and repeated calls with the
+  same operation plus request digest inside one task.
+- `loop_count` / `escalations`: Stop decisions that answered `continue` / `escalate`.
+- `mean_task_duration_s`: span between the first and the last evidence record.
+- `tokens`: `prompt_tokens`, `completion_tokens`, `total_tokens` and `cost`, summed from the JEV call
+  records that capture the OpenRouter usage block.
+- `error_completion_rate`: completed tasks whose last failing evidence has no later passing validation.
+
+Measurement never adds a model call: everything is derived from the existing `metadata.decision="jev_call"`
+audit records and decision records. Truncated JSONL lines are skipped and counted under
+`unreadable_records` instead of failing the whole report.

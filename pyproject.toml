@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "decision-driven-agent"
+version = "0.1.0"
+description = "Phase 1 decision layer for Codex-style agent workflows"
+requires-python = ">=3.10"
+
+[tool.setuptools.packages.find]
+include = ["decision_agent*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

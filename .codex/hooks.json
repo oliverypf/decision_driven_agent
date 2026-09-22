@@ -1,0 +1,59 @@
+{
+  "description": "Decision-Driven Agent Phase 1 lifecycle hooks.",
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python -u \".codex/hooks/decision_agent_hook.py\"",
+            "commandWindows": "python -u \".codex\\hooks\\decision_agent_hook.py\"",
+            "timeout": 10,
+            "statusMessage": "Recording task requirement"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python -u \".codex/hooks/decision_agent_hook.py\"",
+            "commandWindows": "python -u \".codex\\hooks\\decision_agent_hook.py\"",
+            "timeout": 15,
+            "statusMessage": "Checking tool risk"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python -u \".codex/hooks/decision_agent_hook.py\"",
+            "commandWindows": "python -u \".codex\\hooks\\decision_agent_hook.py\"",
+            "timeout": 15,
+            "statusMessage": "Recording execution evidence"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python -u \".codex/hooks/decision_agent_hook.py\"",
+            "commandWindows": "python -u \".codex\\hooks\\decision_agent_hook.py\"",
+            "timeout": 45,
+            "statusMessage": "Checking completion evidence"
+          }
+        ]
+      }
+    ]
+  }
+}
