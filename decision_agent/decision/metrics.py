@@ -8,13 +8,14 @@ call.
 Definitions
 -----------
 ``usable_call_ratio``
-    Attempted JEV calls whose answer the decision path actually adopted,
-    divided by all attempted calls. A call counts as adopted only when the
-    client returned a parsed answer and the recorded adoption carries no error
-    and is not marked ``local``, ``local_fallback`` or ``local_prescreen``.
-``calls_invalid`` / ``calls_duplicate``
-    Attempted calls that were not adopted, and repeated calls with the same
-    operation plus request digest inside one task.
+    Adopted JEV calls divided by attempted calls with complete adoption
+    provenance. Legacy records without ``source``, ``fallback`` and
+    ``fallback_reason`` are reported separately and excluded from this
+    comparable ratio instead of being treated as failed JEV decisions.
+``calls_invalid`` / ``calls_missing_provenance`` / ``calls_duplicate``
+    Complete-provenance calls that were not adopted, legacy calls without
+    complete provenance, and repeated calls with the same operation plus
+    request digest inside one task.
 ``loop_count`` / ``escalations``
     Stop decisions that answered ``continue`` / ``escalate``.
 ``duration_s``
@@ -77,7 +78,9 @@ class TaskMetrics:
     calls_attempted: int
     calls_ok: int
     calls_adopted: int
+    calls_eligible: int
     calls_invalid: int
+    calls_missing_provenance: int
     calls_unavailable: int
     calls_duplicate: int
     usable_call_ratio: float | None
@@ -134,12 +137,17 @@ class MetricsAggregator:
 
         attempted = [entry for entry in calls if entry[0].get("called")]
         unavailable = len(calls) - len(attempted)
-        adopted = [entry for entry in attempted if self._is_adopted(*entry[:2])]
+        eligible = [entry for entry in attempted if self._has_complete_provenance(entry[1])]
+        adopted = [entry for entry in eligible if self._is_adopted(*entry[:2])]
+        missing_provenance = len(attempted) - len(eligible)
         duplicate_keys: dict[tuple[str, str], int] = {}
         by_operation: dict[str, dict[str, int]] = {}
         for call, _context, _metadata in attempted:
             operation = str(call.get("operation") or "unknown")
-            bucket = by_operation.setdefault(operation, {"calls": 0, "adopted": 0, "invalid": 0})
+            bucket = by_operation.setdefault(
+                operation,
+                {"calls": 0, "adopted": 0, "invalid": 0, "missing_provenance": 0},
+            )
             bucket["calls"] += 1
             digest = str(call.get("request_digest") or "")
             if digest:
@@ -147,8 +155,13 @@ class MetricsAggregator:
                 duplicate_keys[key] = duplicate_keys.get(key, 0) + 1
         for call, context, _metadata in attempted:
             operation = str(call.get("operation") or "unknown")
-            bucket = by_operation.setdefault(operation, {"calls": 0, "adopted": 0, "invalid": 0})
-            if self._is_adopted(call, context):
+            bucket = by_operation.setdefault(
+                operation,
+                {"calls": 0, "adopted": 0, "invalid": 0, "missing_provenance": 0},
+            )
+            if not self._has_complete_provenance(context):
+                bucket["missing_provenance"] += 1
+            elif self._is_adopted(call, context):
                 bucket["adopted"] += 1
             else:
                 bucket["invalid"] += 1
@@ -165,10 +178,12 @@ class MetricsAggregator:
             calls_attempted=len(attempted),
             calls_ok=sum(1 for call, _context, _metadata in attempted if call.get("ok")),
             calls_adopted=len(adopted),
-            calls_invalid=len(attempted) - len(adopted),
+            calls_eligible=len(eligible),
+            calls_invalid=len(eligible) - len(adopted),
+            calls_missing_provenance=missing_provenance,
             calls_unavailable=unavailable,
             calls_duplicate=duplicates,
-            usable_call_ratio=round(len(adopted) / len(attempted), 4) if attempted else None,
+            usable_call_ratio=round(len(adopted) / len(eligible), 4) if eligible else None,
             loop_count=sum(1 for status in stop_statuses if status == "continue"),
             escalations=sum(1 for status in stop_statuses if status == "escalate"),
             completed=completed,
@@ -187,12 +202,22 @@ class MetricsAggregator:
             return self.report([self._task_from_file(root)])
         if not root.exists():
             raise MetricsError(f"Evidence path does not exist: {root}")
-        return self.report([self._task_from_file(item) for item in sorted(root.glob("**/evidence.jsonl"))])
+        files = sorted(root.glob("**/evidence.jsonl"))
+        # A project evidence root may contain a legacy shared file directly at
+        # its root plus the current <session>/<turn> stores. That shared file
+        # is not a task and must not distort task counts or ratios. Preserve a
+        # direct file when it is the only store, so aggregate_path(store_dir)
+        # remains useful for one standalone store.
+        direct = root / "evidence.jsonl"
+        if len(files) > 1 and direct in files:
+            files.remove(direct)
+        return self.report([self._task_from_file(item) for item in files])
 
     def report(self, tasks: Iterable[TaskMetrics]) -> MetricsReport:
         collected = list(tasks)
         attempted = sum(task.calls_attempted for task in collected)
         adopted = sum(task.calls_adopted for task in collected)
+        eligible = sum(task.calls_eligible for task in collected)
         completed = [task for task in collected if task.completed]
         error_completed = [task for task in completed if task.completed_with_error]
         durations = [task.duration_s for task in collected if task.duration_s is not None]
@@ -202,18 +227,23 @@ class MetricsAggregator:
             for key, value in task.tokens.items():
                 tokens[key] = tokens.get(key, 0) + value
             for operation, bucket in task.by_operation.items():
-                merged = by_operation.setdefault(operation, {"calls": 0, "adopted": 0, "invalid": 0})
+                merged = by_operation.setdefault(
+                    operation,
+                    {"calls": 0, "adopted": 0, "invalid": 0, "missing_provenance": 0},
+                )
                 for key, value in bucket.items():
                     merged[key] = merged.get(key, 0) + int(value)
         totals = {
             "tasks": len(collected),
             "calls_attempted": attempted,
             "calls_adopted": adopted,
+            "calls_eligible": eligible,
             "calls_invalid": sum(task.calls_invalid for task in collected),
+            "calls_missing_provenance": sum(task.calls_missing_provenance for task in collected),
             "calls_unavailable": sum(task.calls_unavailable for task in collected),
             "calls_duplicate": sum(task.calls_duplicate for task in collected),
             "unreadable_records": sum(task.unreadable_records for task in collected),
-            "usable_call_ratio": round(adopted / attempted, 4) if attempted else None,
+            "usable_call_ratio": round(adopted / eligible, 4) if eligible else None,
             "loop_count": sum(task.loop_count for task in collected),
             "escalations": sum(task.escalations for task in collected),
             "completed_tasks": len(completed),
@@ -231,19 +261,29 @@ class MetricsAggregator:
 
     # -- helpers ---------------------------------------------------------
 
-    def _is_adopted(self, call: Mapping[str, Any], context: Mapping[str, Any]) -> bool:
-        if not call.get("ok") or context.get("error"):
-            return False
+    @staticmethod
+    def _has_complete_provenance(context: Mapping[str, Any]) -> bool:
         adopted = context.get("adopted")
         if not isinstance(adopted, Mapping):
             return False
         source = adopted.get("source")
         fallback = adopted.get("fallback")
         fallback_reason = adopted.get("fallback_reason")
-        if not isinstance(source, str) or not source.strip():
+        return (
+            isinstance(source, str)
+            and bool(source.strip())
+            and isinstance(fallback, bool)
+            and isinstance(fallback_reason, str)
+        )
+
+    def _is_adopted(self, call: Mapping[str, Any], context: Mapping[str, Any]) -> bool:
+        if not call.get("ok") or context.get("error"):
             return False
-        if not isinstance(fallback, bool) or not isinstance(fallback_reason, str):
+        if not self._has_complete_provenance(context):
             return False
+        adopted = context["adopted"]
+        source = adopted["source"]
+        fallback = adopted["fallback"]
         if fallback:
             return False
         return source.lower() not in self._fallback_sources

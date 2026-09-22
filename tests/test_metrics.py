@@ -140,7 +140,33 @@ class MetricsAggregatorTests(unittest.TestCase):
         metrics = self.aggregator.aggregate(records)
 
         self.assertEqual(metrics.calls_adopted, 0)
-        self.assertEqual(metrics.calls_invalid, 1)
+        self.assertEqual(metrics.calls_eligible, 0)
+        self.assertEqual(metrics.calls_invalid, 0)
+        self.assertEqual(metrics.calls_missing_provenance, 1)
+        self.assertIsNone(metrics.usable_call_ratio)
+
+    def test_legacy_provenance_is_excluded_from_comparable_ratio(self):
+        records = [
+            _call_record(
+                "stop",
+                digest="new",
+                adopted={
+                    "status": "stop",
+                    "source": "JEV",
+                    "fallback": False,
+                    "fallback_reason": "",
+                },
+            ),
+            _call_record("stop", digest="legacy"),
+        ]
+
+        metrics = self.aggregator.aggregate(records)
+
+        self.assertEqual(metrics.calls_attempted, 2)
+        self.assertEqual(metrics.calls_eligible, 1)
+        self.assertEqual(metrics.calls_adopted, 1)
+        self.assertEqual(metrics.calls_missing_provenance, 1)
+        self.assertEqual(metrics.usable_call_ratio, 1.0)
 
     def test_duplicate_decisions_are_counted_per_operation_and_digest(self):
         records = [
@@ -297,7 +323,7 @@ class MetricsReportTests(unittest.TestCase):
             with self.assertRaises(MetricsError):
                 MetricsAggregator().aggregate_path(missing)
 
-    def test_root_level_store_is_included_alongside_nested_stores(self):
+    def test_legacy_root_level_store_is_excluded_when_nested_stores_exist(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             (root / "evidence.jsonl").write_text(
@@ -313,8 +339,8 @@ class MetricsReportTests(unittest.TestCase):
 
             report = MetricsAggregator().aggregate_path(root)
 
-            self.assertEqual(len(report.tasks), 2)
-            self.assertEqual(report.totals["calls_attempted"], 2)
+            self.assertEqual(len(report.tasks), 1)
+            self.assertEqual(report.totals["calls_attempted"], 1)
 
     def test_truncated_records_are_counted_instead_of_aborting(self):
         with tempfile.TemporaryDirectory() as temp_dir:

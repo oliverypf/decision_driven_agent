@@ -46,16 +46,28 @@ class RoutingTests(unittest.TestCase):
         space = {"candidates": [{"id": "a", "action": "test"}], "criteria": ["x"], "constraints": ["x"], "evidence": ["x"]}
         result = route("verify", space, client=Fake(["q0", "q1"]))
         self.assertEqual(result["direction"], "COLLECT_EVIDENCE")
-        self.assertEqual(result["source"], "local_fallback")
-        self.assertTrue(result["fallback"])
-        self.assertIn("JEV selected NONE", result["fallback_reason"])
+        self.assertEqual(result["source"], "JEV")
+        self.assertFalse(result["fallback"])
+        self.assertEqual(result["fallback_reason"], "")
 
-    def test_invalid_response(self):
-        result = route("fix", client=Fake(["missing"]))
-        self.assertEqual(result["direction"], "ESCALATE")
-        self.assertEqual(result["source"], "local_fallback")
-        self.assertTrue(result["fallback"])
-        self.assertTrue(result["fallback_reason"])
+    def test_low_confidence_valid_response_is_adopted_from_jev(self):
+        class LowConfidence:
+            available = True
+            model = "fake"
+
+            def decide(self, *, state, questions):
+                return {
+                    "answers": {
+                        key: {"noul": 0.2 if key == "q1" else 0.1}
+                        for key in questions
+                    }
+                }
+
+        result = route("fix", client=LowConfidence())
+        self.assertEqual(result["direction"], "BUILD_CANDIDATES")
+        self.assertEqual(result["source"], "JEV")
+        self.assertFalse(result["fallback"])
+        self.assertEqual(result["fallback_reason"], "")
 
     def test_oversized_state_is_marked_as_fallback(self):
         result = route(
@@ -171,22 +183,33 @@ class RoutingTests(unittest.TestCase):
                 self.assertFalse(adopted['fallback'])
                 self.assertEqual(adopted['fallback_reason'], '')
 
-    def test_round_limit_is_recorded_with_fallback_provenance(self):
+    def test_round_limit_is_decided_by_jev(self):
         from decision_agent.direction import main as direction_main
 
         with TemporaryDirectory() as root:
             packet_dir = Path(root, 'evidence', 'sess', 'turn-3')
             packet_dir.mkdir(parents=True)
             packet = packet_dir / 'decision-space.json'
-            packet.write_text('{}', encoding='utf-8')
+            packet.write_text(
+                json.dumps({
+                    'goal': 'select a safe candidate and verify it',
+                    'candidates': [{'id': 'a', 'action': 'run unit tests'}],
+                    'criteria': ['tests pass'],
+                    'constraints': ['read only'],
+                    'evidence': ['existing tests cover the change'],
+                }),
+                encoding='utf-8',
+            )
             ledger = packet_dir / 'direction-rounds.jsonl'
             ledger.write_text('{}\n{}\n{}\n', encoding='utf-8')
-            with patch('sys.argv', ['decision_route.py', str(packet)]), \
+            with patch('decision_agent.direction.JevClient', return_value=Fake(['q4'])), \
+                    patch('sys.argv', ['decision_route.py', str(packet)]), \
                     contextlib.redirect_stdout(io.StringIO()) as output:
                 direction_main()
 
             result = json.loads(output.getvalue())
-            self.assertEqual(result['reason'], 'round_limit')
-            self.assertEqual(result['source'], 'local_fallback')
-            self.assertTrue(result['fallback'])
+            self.assertEqual(result['direction'], 'ESCALATE')
+            self.assertEqual(result['source'], 'JEV')
+            self.assertFalse(result['fallback'])
+            self.assertEqual(len(result['calls']), 1)
             self.assertEqual(len(ledger.read_text(encoding='utf-8').splitlines()), 4)

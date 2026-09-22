@@ -884,7 +884,7 @@ class CodexHookPreToolUseTests(unittest.TestCase):
                     tool_input={"command": "rg -n hook README.md"},
                 )
 
-            self.assertEqual(response, {"continue": True})
+            self.assertEqual(response, {})
             self.assertEqual(fake.risk_requests, [])
             tool_decisions = [
                 record for record in self._records(root)
@@ -942,7 +942,7 @@ class CodexHookPreToolUseTests(unittest.TestCase):
                     tool_input={"command": "git commit -m 'update'"},
                 )
 
-            self.assertEqual(response, {"continue": True})
+            self.assertEqual(response, {})
             self.assertEqual(len(fake.risk_requests), 1)
             self.assertEqual(fake.risk_requests[0]["timeout"], 8.0)
             records = self._records(root)
@@ -972,7 +972,7 @@ class CodexHookPreToolUseTests(unittest.TestCase):
                     tool_input={"command": "git commit -m 'update'"},
                 )
 
-            self.assertTrue(response.get("continue"))
+            self.assertNotIn("continue", response)
             self.assertIn("PreToolUse decision", response.get("systemMessage", ""))
             tool_decisions = [
                 record for record in self._records(root)
@@ -1003,8 +1003,17 @@ class CodexHookPreToolUseTests(unittest.TestCase):
                     tool_input={"command": "git commit -m 'update'"},
                 )
 
-            self.assertTrue(response.get("continue"))
+            self.assertNotIn("continue", response)
             self.assertNotIn("permissionDecision", response.get("hookSpecificOutput", {}))
+
+    def test_pretooluse_exception_returns_a_contract_safe_response(self):
+        root = tempfile.mkdtemp()
+        with patch.object(codex_hook, "_handle_pre_tool_use", side_effect=RuntimeError("storage down")):
+            with patch("sys.stdin") as stdin, patch("builtins.print") as output:
+                stdin.read.return_value = json.dumps({"hook_event_name": "PreToolUse"})
+                codex_hook.main(root_dir=root)
+                result = json.loads(output.call_args[0][0])
+        self.assertEqual(result, {})
 
     def test_stop_handler_exception_blocks_completion(self):
         root = tempfile.mkdtemp()

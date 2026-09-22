@@ -609,14 +609,15 @@ def _handle_pre_tool_use(payload: Mapping[str, Any], root: Path) -> dict[str, An
         }
     if decision.recommendation != "proceed" or decision.risk == "high":
         return {
-            "continue": True,
             "systemMessage": f"PreToolUse decision: {summary}",
             "hookSpecificOutput": {
                 "hookEventName": "PreToolUse",
                 "additionalContext": f"PreToolUse decision: {summary}",
             },
         }
-    return {"continue": True}
+    # PreToolUse has no supported non-blocking `continue` field. An empty
+    # JSON object is a successful advisory result; Codex proceeds normally.
+    return {}
 
 
 def _handle_stop(payload: Mapping[str, Any], root: Path) -> dict[str, Any]:
@@ -753,7 +754,10 @@ def main(*, root_dir: str | Path | None = None) -> int:
                 "systemMessage": f"Decision layer error: {exc}",
             }
         else:
-            result = {"continue": True}
+            # `continue` is not a valid PreToolUse response. Returning an
+            # empty object keeps the fail-open behavior without making Codex
+            # mark the hook run as malformed.
+            result = {} if payload.get("hook_event_name") == "PreToolUse" else {"continue": True}
     print(json.dumps(result, ensure_ascii=True, sort_keys=True))
     return 0
 

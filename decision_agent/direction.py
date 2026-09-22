@@ -15,7 +15,7 @@ DIRECTIONS = {
     "BUILD_CANDIDATES": "The problem is open: the reasoning model must construct alternatives and evaluation criteria.",
     "COLLECT_EVIDENCE": "Alternatives exist but choosing requires more code inspection, tests or factual evidence.",
     "CLARIFY_GOAL": "The user's objective or essential constraints are ambiguous and require clarification.",
-    "ESCALATE": "The direction cannot be determined reliably; reasoning-model analysis is needed.",
+    "ESCALATE": "The direction cannot be determined reliably, especially at the refinement limit; reasoning-model analysis is needed.",
 }
 
 
@@ -70,9 +70,10 @@ def choose(client, state, options, audit, *, operation="direction_route", timeou
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or not 0 <= value <= 1:
                 raise ValueError("invalid_score")
             scores[name] = value
-        ranked = sorted(scores, key=scores.get, reverse=True)
-        winner = ranked[0]
-        certain = scores[winner] >= 0.6 and (len(ranked) == 1 or scores[winner] - scores[ranked[1]] >= 0.1)
+        # The JEV scores are the decision output. Local code validates their
+        # shape and selects the highest-scoring option, but must not impose a
+        # second confidence/margin policy that changes a valid JEV result.
+        winner = max(scores, key=scores.get)
         audit.append(
             {
                 "called": True,
@@ -85,20 +86,7 @@ def choose(client, state, options, audit, *, operation="direction_route", timeou
                 "adopted": {"source": "JEV", "fallback": False, "fallback_reason": ""},
             }
         )
-        if certain:
-            return winner, scores, {"source": "JEV", "fallback": False, "fallback_reason": ""}
-        reason = "JEV scores did not meet the direction confidence or margin threshold."
-        provenance = {
-            "source": "local_fallback",
-            "fallback": True,
-            "fallback_reason": reason,
-        }
-        audit[-1].update(provenance, adopted=dict(provenance))
-        return "ESCALATE", scores, {
-            "source": "local_fallback",
-            "fallback": True,
-            "fallback_reason": reason,
-        }
+        return winner, scores, {"source": "JEV", "fallback": False, "fallback_reason": ""}
     except Exception as exc:
         fallback_reason = f"JEV {operation} failed: {exc}"[:300]
         audit.append(
@@ -124,10 +112,15 @@ def choose(client, state, options, audit, *, operation="direction_route", timeou
         }
 
 
-def route(requirement, space=None, *, client=None, timeout=None):
+def route(requirement, space=None, *, client=None, timeout=None, iteration=0):
     client = client or JevClient(timeout=3.0)
     space = space if isinstance(space, dict) else {}
-    state = {"goal": requirement, "space": space}
+    state = {
+        "goal": requirement,
+        "space": space,
+        "iteration": max(0, int(iteration)),
+        "refinement_limit": 3,
+    }
     audit = []
     try:
         state_size = len(json.dumps(state, ensure_ascii=True, default=str))
@@ -174,7 +167,10 @@ def route(requirement, space=None, *, client=None, timeout=None):
             )
         else:
             options = {f"candidate_{i}": c["action"] for i, c in enumerate(space["candidates"])}
-            options["NONE"] = "No candidate is adequately supported or safe; gather evidence or reason further."
+            options["COLLECT_EVIDENCE"] = (
+                "No candidate is adequately supported or safe; gather more evidence before selecting one."
+            )
+            options["ESCALATE"] = "The candidate choice requires reasoning-model review."
             selected, selection_scores, selection_provenance = choose(
                 client,
                 state,
@@ -184,19 +180,8 @@ def route(requirement, space=None, *, client=None, timeout=None):
                 timeout=timeout,
             )
             result["selection_scores"] = selection_scores
-            if selected in ("ESCALATE", "NONE"):
-                if selected == "ESCALATE":
-                    result.update(direction="ESCALATE", **selection_provenance)
-                else:
-                    result.update(
-                        direction="COLLECT_EVIDENCE",
-                        source="local_fallback",
-                        fallback=True,
-                        fallback_reason=(
-                            "JEV selected NONE; the local safety route redirected "
-                            "the task to evidence collection."
-                        ),
-                    )
+            if selected in ("ESCALATE", "COLLECT_EVIDENCE"):
+                result.update(direction=selected, **selection_provenance)
             else:
                 result["candidate_id"] = space["candidates"][int(selected.split("_")[1])]["id"]
     if result.get("fallback"):
@@ -233,7 +218,7 @@ def prompt_context(controller, state, *, timeout=None):
         "goal (string), candidates ([{id,action}]), criteria ([string]), constraints ([string]), "
         "evidence ([string with concrete observations/references]) to " + str(packet)
         + '. Then run python "' + str(route_script) + '" "' + str(packet)
-        + '". Re-check after changes, at most three refinements. Do not manufacture evidence or execute '
+         + '". Re-check after changes; the refinement count is supplied to JEV, which decides whether to escalate. Do not manufacture evidence or execute '
         "candidate commands automatically; use normal permission and validation checks."
     )
     return {"continue": True, "hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": context}}
@@ -248,38 +233,29 @@ def main():
     rounds = len(ledger.read_text(encoding="utf-8").splitlines()) if ledger.exists() else 0
     goal = ""
     client = None
-    if rounds >= 3:
-        reason = "The direction refinement limit was reached; strong-model review is required."
+    try:
+        if packet.stat().st_size > 24000:
+            raise ValueError("packet_too_large")
+        data = json.loads(packet.read_text(encoding="utf-8"))
+        if not isinstance(data, dict) or not isinstance(data.get("goal"), str):
+            raise ValueError("invalid_packet")
+        goal = data["goal"].strip()
+        if not goal:
+            raise ValueError("empty_goal")
+        client = JevClient(timeout=3.0)
+        # The refinement count is evidence supplied to JEV. It is not a local
+        # command to escalate, so JEV remains the authority at the limit.
+        result = route(goal, data, client=client, iteration=rounds)
+    except (OSError, ValueError):
+        reason = "The direction packet was missing, unreadable or invalid."
         result = {
             "direction": "ESCALATE",
-            "reason": "round_limit",
+            "reason": "invalid_packet",
             "calls": [],
             "source": "local_fallback",
             "fallback": True,
             "fallback_reason": reason,
         }
-    else:
-        try:
-            if packet.stat().st_size > 24000:
-                raise ValueError("packet_too_large")
-            data = json.loads(packet.read_text(encoding="utf-8"))
-            if not isinstance(data, dict) or not isinstance(data.get("goal"), str):
-                raise ValueError("invalid_packet")
-            goal = data["goal"].strip()
-            if not goal:
-                raise ValueError("empty_goal")
-            client = JevClient(timeout=3.0)
-            result = route(goal, data, client=client)
-        except (OSError, ValueError):
-            reason = "The direction packet was missing, unreadable or invalid."
-            result = {
-                "direction": "ESCALATE",
-                "reason": "invalid_packet",
-                "calls": [],
-                "source": "local_fallback",
-                "fallback": True,
-                "fallback_reason": reason,
-            }
     ledger.parent.mkdir(parents=True, exist_ok=True)
     with ledger.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(result, ensure_ascii=True) + "\n")

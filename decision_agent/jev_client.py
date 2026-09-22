@@ -8,6 +8,7 @@ import math
 import os
 import time
 from collections.abc import Callable, Mapping
+from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -37,6 +38,10 @@ _CONTENT_LIMITS = {
 }
 _DEFAULT_CONTENT_LIMIT = 600
 _SHRUNK_CONTENT_LIMIT = 240
+_DEFAULT_BASE_URL = "https://openrouter.ai/api/alpha/decisions"
+_DEFAULT_MODEL = "~typesafe/jev-latest"
+_DEFAULT_TIMEOUT = 30.0
+_CONFIG_FILENAME = "jev.config.json"
 
 _FAILURE_TYPE_INSTRUCTIONS = {
     "CODE_ERROR": (
@@ -63,14 +68,72 @@ _FAILURE_TYPE_INSTRUCTIONS = {
 class JevClient:
     """Call OpenRouter's decisions endpoint without adding a dependency."""
 
-    def __init__(self, *, api_key: str | None = None, base_url: str = "https://openrouter.ai/api/alpha/decisions", model: str = "~typesafe/jev-latest", timeout: float = 30.0, opener: Callable[..., Any] = urlopen):
-        self.api_key = api_key or os.getenv("OPENROUTER_API_KEY")
-        self.base_url = base_url.rstrip("/")
-        self.model = model
-        self.timeout = timeout
+    def __init__(
+        self,
+        *,
+        api_key: str | None = None,
+        base_url: str | None = None,
+        model: str | None = None,
+        timeout: float | None = None,
+        config_path: str | Path | None = None,
+        opener: Callable[..., Any] = urlopen,
+    ):
+        config = self._load_config(config_path)
+        self.api_key = api_key or self._config_string(config, "api_key") or os.getenv("OPENROUTER_API_KEY")
+        self.base_url = (
+            base_url
+            or self._config_string(config, "base_url")
+            or _DEFAULT_BASE_URL
+        ).rstrip("/")
+        self.model = model or self._config_string(config, "model") or _DEFAULT_MODEL
+        configured_timeout = timeout if timeout is not None else config.get("timeout", _DEFAULT_TIMEOUT)
+        self.timeout = self._positive_timeout(configured_timeout)
         self._opener = opener
         self._last_call: dict[str, Any] | None = None
         self._call_history: list[dict[str, Any]] = []
+
+    @staticmethod
+    def _config_string(config: Mapping[str, Any], key: str) -> str | None:
+        value = config.get(key)
+        return value.strip() if isinstance(value, str) and value.strip() else None
+
+    @staticmethod
+    def _positive_timeout(value: Any) -> float:
+        if isinstance(value, bool):
+            return _DEFAULT_TIMEOUT
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return _DEFAULT_TIMEOUT
+        return parsed if math.isfinite(parsed) and parsed > 0 else _DEFAULT_TIMEOUT
+
+    @classmethod
+    def _load_config(cls, config_path: str | Path | None) -> dict[str, Any]:
+        """Load an optional project config without making startup fragile.
+
+        An explicit path wins; otherwise ``DECISION_AGENT_CONFIG`` can point to
+        a file. With neither set, walk from the current directory upwards and
+        use the first ``jev.config.json`` found. Invalid or unreadable config
+        is treated as absent so the existing defaults remain safe.
+        """
+
+        candidates: list[Path] = []
+        if config_path is not None:
+            candidates.append(Path(config_path).expanduser())
+        else:
+            configured_path = os.getenv("DECISION_AGENT_CONFIG")
+            if configured_path:
+                candidates.append(Path(configured_path).expanduser())
+            current = Path.cwd().resolve()
+            candidates.extend(directory / _CONFIG_FILENAME for directory in (current, *current.parents))
+        for candidate in candidates:
+            try:
+                with candidate.resolve().open("r", encoding="utf-8") as handle:
+                    data = json.load(handle)
+            except (OSError, ValueError, TypeError):
+                continue
+            return dict(data) if isinstance(data, Mapping) else {}
+        return {}
 
     @property
     def available(self) -> bool:

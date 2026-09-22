@@ -1690,6 +1690,77 @@ class JevCallRecordTests(unittest.TestCase):
         )
         self.assertEqual(len(call["request_digest"]), 16)
 
+    def test_client_loads_connection_settings_from_config_file(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir, "jev.config.json")
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "api_key": "config-key",
+                        "base_url": "http://localhost:8123/decisions/",
+                        "model": "config-model",
+                        "timeout": 12.5,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            client = JevClient(config_path=config_path)
+
+            self.assertEqual(client.api_key, "config-key")
+            self.assertEqual(client.base_url, "http://localhost:8123/decisions")
+            self.assertEqual(client.model, "config-model")
+            self.assertEqual(client.timeout, 12.5)
+
+    def test_explicit_client_settings_override_config_file(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir, "jev.config.json")
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "api_key": "config-key",
+                        "base_url": "http://config/decisions",
+                        "model": "config-model",
+                        "timeout": 12.5,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            client = JevClient(
+                config_path=config_path,
+                api_key="explicit-key",
+                base_url="http://explicit/decisions",
+                model="explicit-model",
+                timeout=4.0,
+            )
+
+            self.assertEqual(client.api_key, "explicit-key")
+            self.assertEqual(client.base_url, "http://explicit/decisions")
+            self.assertEqual(client.model, "explicit-model")
+            self.assertEqual(client.timeout, 4.0)
+
+    def test_client_discovers_config_from_current_project_directory(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            Path(temp_dir, "jev.config.json").write_text(
+                json.dumps({"base_url": "http://discovered/decisions"}),
+                encoding="utf-8",
+            )
+            with patch("decision_agent.jev_client.Path.cwd", return_value=Path(temp_dir)):
+                client = JevClient()
+
+            self.assertEqual(client.base_url, "http://discovered/decisions")
+
+    def test_invalid_config_keeps_safe_defaults(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir, "jev.config.json")
+            config_path.write_text("{not valid json", encoding="utf-8")
+            with patch.dict(os.environ, {"OPENROUTER_API_KEY": "env-key"}):
+                client = JevClient(config_path=config_path)
+
+            self.assertEqual(client.api_key, "env-key")
+            self.assertEqual(client.base_url, "https://openrouter.ai/api/alpha/decisions")
+            self.assertEqual(client.model, "~typesafe/jev-latest")
+            self.assertEqual(client.timeout, 30.0)
+
     def test_identical_requests_share_a_digest_and_changed_requests_do_not(self):
         body = {"answers": {"probe": {"noul": 0.5}}}
         client = JevClient(api_key="test-key", opener=lambda request, timeout=None: self._Response(body))

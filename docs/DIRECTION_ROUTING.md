@@ -18,8 +18,9 @@ that a real App task invoked it; verify a real session separately.
 UserPromptSubmit now requests a direction, not a completion verdict.
 JEV scores five fixed choices: SELECT_CANDIDATE, BUILD_CANDIDATES,
 COLLECT_EVIDENCE, CLARIFY_GOAL and ESCALATE. Scores are independent
-suitability scores, not a normalized probability distribution.
-A score below 0.6 or a winner margin below 0.1 falls back to ESCALATE.
+  suitability scores, not a normalized probability distribution. The local
+  adapter validates the scores and adopts JEV's highest-scoring choice; it
+  does not impose a second confidence or margin decision.
 
 The hook returns advisory additionalContext to the coding model. It does not
 replace the host scheduler or automatically execute a candidate. The model
@@ -41,12 +42,15 @@ Packet schema:
 The structural closure guard requires 1-8 unique actionable candidates and
 nonempty criteria, constraints and evidence. Semantic adequacy still depends
 on the model and actual evidence; structure alone does not prove closure.
-JEV then scores only those candidates plus NONE. No generated command is
-executed automatically. Selection must still obey user permissions and tests.
+JEV then scores those candidates plus the explicit COLLECT_EVIDENCE and
+ESCALATE choices. No generated command is executed automatically. Selection
+must still obey user permissions and tests.
 
-Each packet directory permits three refinement calls; after that the result
-is ESCALATE. Network failures and malformed scores also escalate without
-blocking the user's task. Each request has a three-second network timeout.
+The refinement count and three-call limit are supplied as evidence to JEV so
+JEV decides whether the direction should escalate at the limit. Network
+failures and malformed scores use the explicit local fallback and escalate
+without blocking the user's task. Each request has a three-second network
+timeout.
 The Stop completion check is JEV-driven in two stages: JEV first scores whether the user goal is complete and identifies the task domain, then scores whether stopping is allowed under that domain's completion contract. Information and investigation tasks do not inherit implementation-only requirements such as a git diff or tests. Local code only validates the response and enforces the hard iteration-limit safety guard. If JEV is unavailable, times out or returns an invalid answer, the decision is marked with `source="local_fallback"`, `fallback=true` and a `fallback_reason` before the hook uses a domain-aware conservative local fallback, so the fallback is never presented as a JEV conclusion.
 
 The PreToolUse risk and tool-appropriateness judgment follows the same pattern: read-only calls, validation commands, dedicated file-edit tools and unambiguously destructive commands are decided by the local pre-screen (the destructive verdict is the only path that denies the call), and everything else is submitted to JEV. Each hook passes an explicit per-call timeout budget so a slow model call degrades to the marked fallback instead of the hook being killed.

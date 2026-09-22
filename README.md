@@ -58,6 +58,8 @@ To activate the project hook in Codex, open this project and review/trust the un
 
 When `OPENROUTER_API_KEY` is configured, the Stop hook makes two JEV decisions: goal completion/domain classification, followed by a domain-specific stop gate. Information and investigation tasks can complete with an answer or supported finding without a git diff or tests; implementation and configuration tasks still require the evidence appropriate to those domains. Local code only validates the response shape and enforces hard safety constraints such as the iteration limit. If JEV is unavailable, times out or returns an invalid answer, the hook records `source="local_fallback"` with the failure reason and falls back to a domain-aware conservative decision rather than presenting the local result as a JEV conclusion. Each hook passes an explicit per-call JEV timeout budget (Stop 18s per decision, PostToolUse 10s, PreToolUse 8s) so a slow model call degrades to the marked fallback instead of the hook being killed.
 
+JEV connection defaults can be changed in a project-root `jev.config.json` (copy `jev.config.example.json` to start). Supported fields are `base_url`, `model`, `api_key` and `timeout`. Keep the API key in `OPENROUTER_API_KEY` when possible; `jev.config.json` is ignored by Git. Explicit `JevClient(...)` arguments take precedence over the file, then the file takes precedence over built-in defaults. Set `DECISION_AGENT_CONFIG` when the config file lives elsewhere. Invalid or missing configuration falls back to the built-in endpoint, model and timeout.
+
 ## Efficiency routers
 
 The repository includes first-pass routing decisions for reducing wasted model and tool calls:
@@ -73,7 +75,11 @@ Each router returns a structured `RoutingDecision` with the chosen candidate, co
 
 `python -m decision_agent metrics [PATH]` aggregates the observation metrics from persisted evidence
 (`.decision/evidence` by default; a single `evidence.jsonl`, one store directory, or a whole evidence root
-all work). The report carries per-task entries plus project totals:
+all work). A legacy shared `evidence.jsonl` directly under a project evidence root is excluded when
+task-scoped stores are present. Calls without complete adoption provenance are reported as
+`calls_missing_provenance` and excluded from the comparable `usable_call_ratio`; pass `--store-dir`
+to decision CLI commands when durable audit persistence is required, otherwise they use an isolated
+temporary store. The report carries per-task entries plus project totals:
 
 - `usable_call_ratio`: attempted JEV calls whose answer was adopted, divided by all attempted calls.
 - `calls_invalid` / `calls_duplicate`: attempted calls that were not adopted, and repeated calls with the

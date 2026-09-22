@@ -1,13 +1,13 @@
 {
-  "description": "Decision-Driven Agent Phase 1 lifecycle hooks.",
+  "description": "Decision-Driven Agent project lifecycle hooks using the repository decision layer and JEV configuration.",
   "hooks": {
     "UserPromptSubmit": [
       {
         "hooks": [
           {
             "type": "command",
-            "command": "python -u \".codex/hooks/decision_agent_hook.py\"",
-            "commandWindows": "python -u \".codex\\hooks\\decision_agent_hook.py\"",
+            "command": "python -u \"$(git rev-parse --show-toplevel)/.codex/hooks/decision_agent_hook.py\"",
+            "commandWindows": "for /f \"delims=\" %i in ('git rev-parse --show-toplevel') do @python -u \"%i\\.codex\\hooks\\decision_agent_hook.py\"",
             "timeout": 10,
             "statusMessage": "Recording task requirement"
           }
@@ -20,8 +20,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python -u \".codex/hooks/decision_agent_hook.py\"",
-            "commandWindows": "python -u \".codex\\hooks\\decision_agent_hook.py\"",
+            "command": "python -u \"$(git rev-parse --show-toplevel)/.codex/hooks/decision_agent_hook.py\"",
+            "commandWindows": "for /f \"delims=\" %i in ('git rev-parse --show-toplevel') do @python -u \"%i\\.codex\\hooks\\decision_agent_hook.py\"",
             "timeout": 15,
             "statusMessage": "Checking tool risk"
           }
@@ -34,8 +34,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python -u \".codex/hooks/decision_agent_hook.py\"",
-            "commandWindows": "python -u \".codex\\hooks\\decision_agent_hook.py\"",
+            "command": "python -u \"$(git rev-parse --show-toplevel)/.codex/hooks/decision_agent_hook.py\"",
+            "commandWindows": "for /f \"delims=\" %i in ('git rev-parse --show-toplevel') do @python -u \"%i\\.codex\\hooks\\decision_agent_hook.py\"",
             "timeout": 15,
             "statusMessage": "Recording execution evidence"
           }
@@ -47,8 +47,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python -u \".codex/hooks/decision_agent_hook.py\"",
-            "commandWindows": "python -u \".codex\\hooks\\decision_agent_hook.py\"",
+            "command": "python -u \"$(git rev-parse --show-toplevel)/.codex/hooks/decision_agent_hook.py\"",
+            "commandWindows": "for /f \"delims=\" %i in ('git rev-parse --show-toplevel') do @python -u \"%i\\.codex\\hooks\\decision_agent_hook.py\"",
             "timeout": 45,
             "statusMessage": "Checking completion evidence"
           }

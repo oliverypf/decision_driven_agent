@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -39,8 +40,11 @@ def build_parser() -> argparse.ArgumentParser:
         command_parser.add_argument("input", help="JSON file path, or - for stdin")
         command_parser.add_argument(
             "--store-dir",
-            default=".decision/evidence",
-            help="Evidence store directory used when input omits evidence",
+            default=None,
+            help=(
+                "Evidence store directory used when input omits evidence; "
+                "omit it to use an isolated temporary audit store"
+            ),
         )
 
     metrics_parser = subparsers.add_parser("metrics")
@@ -60,7 +64,11 @@ def main(argv: list[str] | None = None) -> int:
         _dump(MetricsAggregator().aggregate_path(args.path))
         return 0
     payload = _load_json(args.input)
-    controller = DecisionController.from_directory(args.store_dir)
+    # Standalone CLI calls must not append to the project-level hook evidence
+    # root by default. Callers that need durable, task-scoped evidence can
+    # opt in explicitly with --store-dir.
+    store_dir = args.store_dir or tempfile.mkdtemp(prefix="decision-agent-cli-")
+    controller = DecisionController.from_directory(store_dir)
 
     if args.command == "failure-route":
         _dump(controller.route_failure(FailureInput(**payload)))
