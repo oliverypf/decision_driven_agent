@@ -281,6 +281,8 @@ def main():
                 "source": "JevClient",
                 "decision": "jev_call",
                 "operation": call.get("operation") or "direction_route",
+                "session_id": packet.parent.parent.name,
+                "turn_id": packet.parent.name,
             },
         )
     store.append("decision", {"direction_route": result}, metadata={"source": "candidate_feedback"})

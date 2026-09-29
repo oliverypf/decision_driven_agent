@@ -40,6 +40,15 @@ class DecisionController:
         self.test_selector = TestSelector()
         self.memory_decision = MemoryDecision()
         self._audited_jev_calls = 0
+        self.trace_context: dict[str, Any] = {}
+
+    def set_trace_context(self, *, session_id: str | None = None, turn_id: str | None = None) -> None:
+        """Set lifecycle identifiers to attach to every persisted JEV audit."""
+
+        self.trace_context = {
+            "session_id": str(session_id or "") or None,
+            "turn_id": str(turn_id or "") or None,
+        }
 
     @classmethod
     def from_directory(
@@ -187,6 +196,8 @@ class DecisionController:
                     "source": "JevClient",
                     "decision": "jev_call",
                     "operation": call.get("operation") or operation,
+                    "session_id": self.trace_context.get("session_id"),
+                    "turn_id": self.trace_context.get("turn_id"),
                 },
             )
 

@@ -30,7 +30,19 @@ _LOW_INFORMATION_STEMS = {
     "要", "好", "是", "对", "可以", "行", "继续", "嗯",
     "ok", "okay", "k", "yes", "yeah", "yep", "sure", "go", "proceed", "continue",
 }
-_LOW_INFORMATION_PHRASES = {"do it", "go ahead", "keep going", "go on"}
+_LOW_INFORMATION_PHRASES = {
+    "do it", "go ahead", "keep going", "go on",
+    # `_normalized_reply` strips trailing particles such as "了" and "吧",
+    # so variants like "现在可以了吧" normalize to this shorter form.
+    "现在可以",
+    "现在可以了吗", "现在可以了吧", "现在可以了", "可以了吗", "可以了吧",
+    "现在好了么", "现在好了吗", "现在修好了吗", "现在完成了吗",
+    "stop可以了吗", "stop现在可以了吗", "hook现在可以了吗",
+    "再定位一下，可以stop了吗", "再定位一下可以stop了吗", "再定位一下stop可以了吗",
+    "再定位一下现在可以stop了吗", "再定位一下hook可以stop了吗",
+    "怎样才能通过呢", "怎么才能通过呢", "如何才能通过呢",
+    "怎样才算通过", "怎么才算通过", "如何才算通过",
+}
 _REPLY_TRIM = " \t\r\n。.!！?？~～,，、:：;；\"'“”‘’()（）"
 _REPLY_FILLER_PREFIXES = ("嗯", "呃", "那", "就")
 _REPLY_FILLER_SUFFIXES = ("吧", "呀", "啊", "啦", "哦", "嘛", "的", "了")
@@ -174,7 +186,9 @@ def _save_state(root: Path, state: Mapping[str, Any]) -> None:
     path = _state_path(root, session_id)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(".tmp")
-    temporary.write_text(json.dumps(dict(state), ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+    # Hook payloads can contain unmatched UTF-16 surrogates on Windows.
+    # Escape them on disk so state recovery cannot crash the Stop gate.
+    temporary.write_text(json.dumps(dict(state), ensure_ascii=True, indent=2, sort_keys=True), encoding="utf-8")
     temporary.replace(path)
 
 
@@ -195,7 +209,7 @@ def _normalized_reply(text: Any) -> str:
 
 
 def _is_low_information(text: Any) -> bool:
-    """True when a prompt only acknowledges the goal instead of restating it."""
+    """True when a prompt depends on the current goal instead of restating it."""
 
     normalized = _normalized_reply(text)
     return (
@@ -315,6 +329,7 @@ def _start_task(
         "model": payload.get("model"),
     }
     controller = DecisionController.from_directory(evidence_dir, jev_timeout=jev_timeout)
+    controller.set_trace_context(session_id=session_id, turn_id=turn_id)
     provenance = {
         "session_id": session_id,
         "turn_id": turn_id,
@@ -350,6 +365,31 @@ def _current_task(
 ) -> tuple[DecisionController, dict[str, Any]]:
     session_id = str(payload.get("session_id") or "default")
     state = _load_state(root, session_id)
+    # Stop/PostToolUse can arrive without a preceding prompt hook (for
+    # example after a hook process restart). Do not send an empty synthetic
+    # requirement to JEV when this session already has a real requirement in
+    # an earlier turn's evidence or decision-space packet.
+    if not str(state.get("requirement") or "").strip():
+        recovered, recovered_from = _recent_requirement(root, session_id, state)
+        if recovered:
+            state["requirement"] = recovered
+            state["requirement_source"] = recovered_from
+            state["carried_from"] = recovered_from
+            if str(state.get("task_id") or "") == "uninitialized":
+                session_dir = root / ".decision" / "evidence" / _safe_id(session_id, "default")
+                candidates = sorted(
+                    session_dir.glob("*/evidence.jsonl"),
+                    key=lambda item: item.stat().st_mtime,
+                    reverse=True,
+                )
+                if candidates:
+                    state["task_id"] = candidates[0].parent.name
+                    state["evidence_dir"] = str(candidates[0].parent)
+            # Persist recovery before any later JEV/evidence operation. If
+            # Stop is interrupted or JEV is unavailable, the next hook must
+            # still see the recovered requirement instead of recreating the
+            # uninitialized state.
+            _save_state(root, state)
     if payload.get("requirement") and not state.get("requirement"):
         state["requirement"] = str(payload["requirement"])
     if payload.get("acceptance_criteria") and not state.get("acceptance_criteria"):
@@ -357,7 +397,12 @@ def _current_task(
     if (payload.get("domain") or payload.get("task_domain")) and str(state.get("domain") or "unknown").lower() == "unknown":
         state["domain"] = payload.get("domain") or payload.get("task_domain")
     evidence_dir = Path(str(state.get("evidence_dir") or root / ".decision" / "evidence" / _safe_id(session_id, "default") / "uninitialized"))
-    return DecisionController.from_directory(evidence_dir, jev_timeout=jev_timeout), state
+    controller = DecisionController.from_directory(evidence_dir, jev_timeout=jev_timeout)
+    controller.set_trace_context(
+        session_id=session_id,
+        turn_id=str(payload.get("turn_id") or state.get("task_id") or "uninitialized"),
+    )
+    return controller, state
 
 
 def _handle_user_prompt(payload: Mapping[str, Any], root: Path) -> dict[str, Any]:
@@ -675,6 +720,9 @@ def _handle_stop(payload: Mapping[str, Any], root: Path) -> dict[str, Any]:
         use_model=True,
         timeout=_HOOK_JEV_TIMEOUTS["Stop"],
     )
+    trace_session_id = str(state.get("session_id") or payload.get("session_id") or "unknown")
+    trace_turn_id = str(payload.get("turn_id") or state.get("task_id") or "unknown")
+    trace_suffix = f" [session_id={trace_session_id} turn_id={trace_turn_id}]"
     controller.record_evidence(
         EvidenceKind.DECISION,
         {"hook_event": "Stop", "decision": decision.to_dict()},
@@ -687,16 +735,21 @@ def _handle_stop(payload: Mapping[str, Any], root: Path) -> dict[str, Any]:
     )
 
     status = decision.status.value if hasattr(decision.status, "value") else str(decision.status)
+    # Once JEV has resolved a concrete domain, freeze it for the remainder of
+    # this task. Re-running domain classification on the growing transcript
+    # was the source of implementation/investigation/unknown drift.
+    if decision.domain and str(decision.domain).lower() != "unknown":
+        state["domain"] = decision.domain
     if status == "continue":
         state["stop_attempts"] = iteration + 1
         _save_state(root, state)
-        return {"decision": "block", "reason": decision.reason}
+        return {"decision": "block", "reason": str(decision.reason) + trace_suffix}
     if status == "escalate":
         state["escalated"] = True
         _save_state(root, state)
         return {
             "continue": True,
-            "systemMessage": f"Decision layer escalation: {decision.reason}",
+            "systemMessage": f"Decision layer escalation: {decision.reason}{trace_suffix}",
         }
 
     controller.record_evidence(

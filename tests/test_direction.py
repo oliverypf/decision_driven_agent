@@ -178,6 +178,8 @@ class RoutingTests(unittest.TestCase):
                 ['direction_route', 'direction_select'],
             )
             for audit in audits:
+                self.assertEqual(audit['metadata']['session_id'], 'sess')
+                self.assertEqual(audit['metadata']['turn_id'], 'turn-audit')
                 adopted = audit['content']['context']['adopted']
                 self.assertEqual(adopted['source'], 'JEV')
                 self.assertFalse(adopted['fallback'])

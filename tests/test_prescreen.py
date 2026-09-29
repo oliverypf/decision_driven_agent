@@ -87,6 +87,22 @@ class ToolUsePreScreenTests(unittest.TestCase):
 
 
 class PreScreenTests(unittest.TestCase):
+    def test_searching_historical_test_output_is_not_a_test_run(self):
+        result = prescreen_tool_result(
+            command="Get-Content evidence.jsonl; rg 'Ran 188 tests|test_result' evidence.jsonl; git status --short",
+            response_text="Ran 188 tests in 3.5s\nOK",
+        )
+        self.assertEqual(result.kind, "other")
+        self.assertFalse(result.failed)
+        self.assertFalse(result.needs_model)
+
+    def test_python_unittest_command_is_recognized_as_test_runner(self):
+        result = prescreen_tool_result(
+            command="python -m unittest discover -s tests",
+            response_text="Ran 188 tests in 3.5s\n\nOK",
+        )
+        self.assertEqual(result.kind, "test_result")
+
     def test_exit_code_is_authoritative_for_failure(self):
         result = prescreen_tool_result(command="pytest", response_text="all good", exit_code=1)
         self.assertTrue(result.failed)

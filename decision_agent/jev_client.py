@@ -1,4 +1,4 @@
-"""Minimal OpenRouter client for TypeSafe JEV decisions models."""
+"""Minimal HTTP client for the official TypeSafe JEV API."""
 
 from __future__ import annotations
 
@@ -38,8 +38,8 @@ _CONTENT_LIMITS = {
 }
 _DEFAULT_CONTENT_LIMIT = 600
 _SHRUNK_CONTENT_LIMIT = 240
-_DEFAULT_BASE_URL = "https://openrouter.ai/api/alpha/decisions"
-_DEFAULT_MODEL = "~typesafe/jev-latest"
+_DEFAULT_BASE_URL = "https://api.typesafe.ai/v1/systemone"
+_DEFAULT_MODEL = "jev-latest"
 _DEFAULT_TIMEOUT = 30.0
 _CONFIG_FILENAME = "jev.config.json"
 
@@ -79,7 +79,7 @@ class JevClient:
         opener: Callable[..., Any] = urlopen,
     ):
         config = self._load_config(config_path)
-        self.api_key = api_key or self._config_string(config, "api_key") or os.getenv("OPENROUTER_API_KEY")
+        self.api_key = api_key or os.getenv("JEV_API_KEY") or self._config_string(config, "api_key")
         self.base_url = (
             base_url
             or self._config_string(config, "base_url")
@@ -161,7 +161,7 @@ class JevClient:
                 "called": False,
                 "available": False,
                 "operation": operation,
-                "error": "OPENROUTER_API_KEY is not configured",
+                "error": "JEV_API_KEY is not configured",
             }
         )
 
@@ -257,6 +257,12 @@ class JevClient:
         for item in normalized:
             if str(item.get("kind")) in priority_kinds:
                 add(item)
+        # Keep a small recent tool-output sample even when decision records
+        # dominate the tail. Investigation certificates need the observations
+        # themselves, not just the fact that a tool call occurred.
+        logs = [item for item in normalized if str(item.get("kind")) == "log"]
+        for item in logs[-3:]:
+            add(item)
         for item in normalized[-12:]:
             add(item)
 
@@ -334,7 +340,7 @@ class JevClient:
     ) -> dict[str, Any]:
         if not self.api_key:
             self.note_unavailable(operation)
-            raise JevDecisionError("OPENROUTER_API_KEY is not configured")
+            raise JevDecisionError("JEV_API_KEY is not configured")
         effective_timeout = self.timeout if timeout is None else max(0.5, float(timeout))
         payload = self._sanitize({"model": self.model, "state": dict(state), "questions": dict(questions)})
         request_chars = len(json.dumps(payload, ensure_ascii=True, default=str))
@@ -343,7 +349,7 @@ class JevClient:
         ).hexdigest()[:16]
         # ASCII escaping keeps the request valid even when Windows passes an
         # unmatched surrogate through the hook process.
-        request = Request(self.base_url, data=json.dumps(payload, ensure_ascii=True).encode("utf-8"), headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json", "HTTP-Referer": "http://localhost", "X-OpenRouter-Title": "decision-driven-agent"}, method="POST")
+        request = Request(self.base_url, data=json.dumps(payload, ensure_ascii=True).encode("utf-8"), headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}, method="POST")
         started = time.monotonic()
         try:
             with self._opener(request, timeout=effective_timeout) as response:
@@ -764,7 +770,10 @@ class JevClient:
                 "type": "noul",
                 "instructions": (
                     f"Score 0 to 1 for whether this is the user's task domain: {candidate}. "
-                    "Use the requirement and evidence; treat the supplied domain hint as context, not proof."
+                    "Use the requirement and evidence; treat the supplied domain hint as context, not proof. "
+                    "Use the evidence types, tool names/commands, diffs, test/runtime results, and the user's "
+                    "requested outcome as domain evidence. Score unknown only when no concrete domain is supported; "
+                    "do not use unknown as a generic low-confidence vote when a concrete domain is identifiable."
                 ),
             }
         response = self.decide(
@@ -783,7 +792,26 @@ class JevClient:
         answers = response["answers"]
         goal_score = self._noul_score(answers, "goal_completed")
         domain_scores = {candidate: self._noul_score(answers, f"domain_{candidate}") for candidate in TASK_DOMAINS}
-        winner, winner_score, certain = self._rank(domain_scores)
+        # ``unknown`` is an abstention result, not a peer domain. If it is
+        # ranked alongside real domains it wins whenever the model is merely
+        # cautious, which made Stop report unknown even when the evidence
+        # clearly described (for example) an implementation task. The choice
+        # among concrete domains remains entirely JEV-driven; local code only
+        # applies the bounded abstention rule after receiving JEV scores.
+        concrete_scores = {
+            candidate: score for candidate, score in domain_scores.items() if candidate != "unknown"
+        }
+        winner, winner_score, _ = self._rank(concrete_scores)
+        concrete_ranked = sorted(concrete_scores, key=concrete_scores.get, reverse=True)
+        concrete_margin = (
+            winner_score - concrete_scores[concrete_ranked[1]]
+            if len(concrete_ranked) > 1
+            else winner_score
+        )
+        # Domain scores are comparative evidence across several candidates;
+        # a concrete winner with basic support and a clear lead is useful even
+        # when it is below the generic 0.6 certainty threshold.
+        certain = winner_score >= 0.5 and concrete_margin >= 0.1
         resolved_domain = winner if certain else "unknown"
         domain_confidence = domain_scores.get(resolved_domain, winner_score if resolved_domain == winner else 0.0)
         return {
@@ -845,11 +873,26 @@ class JevClient:
                         "limit. Use this only when the goal or domain gate cannot be judged reliably."
                     ),
                 },
+                "completion_certificate": {
+                    "type": "noul",
+                    "instructions": (
+                        "Alongside the noul score, return a completion certificate object with exactly these fields: status "
+                        "(stop, continue, or escalate), domain, confidence, domain_confidence, reason, "
+                        "claims, and contradictions. Each claim must have id, status (satisfied, unsatisfied, "
+                        "not_applicable, or unverifiable), and evidence_ids copied exactly from the supplied "
+                        "evidence records. A satisfied claim must cite at least one evidence ID. Return stop "
+                        "only when every required claim is satisfied and contradictions is empty. If the JSON "
+                        "certificate cannot be produced, leave this answer absent and use the legacy noul answers."
+                    ),
+                },
             },
             operation="domain_stop",
             timeout=timeout,
         )
         answers = response["answers"]
+        certificate = answers.get("completion_certificate")
+        if certificate is not None and not isinstance(certificate, Mapping):
+            raise JevDecisionError("JEV completion_certificate answer was invalid")
         stop_score = self._noul_score(answers, "domain_stop_allowed")
         missing_score = self._noul_score(answers, "domain_evidence_missing")
         escalate_score = self._noul_score(answers, "escalate_required")
@@ -882,6 +925,7 @@ class JevClient:
                 f"JEV goal completion={goal_completed:.2f}; domain={domain}; "
                 f"domain stop={stop_score:.2f}; selected {status}."
             ),
+            "completion_certificate": certificate,
         }
 
     def judge_stop(
@@ -895,8 +939,21 @@ class JevClient:
         agent_requested_stop: bool,
         domain: str | None = None,
         timeout: float | None = None,
+        require_certificate: bool = False,
     ) -> dict[str, Any]:
         """Run goal completion first, then apply the JEV-selected domain gate."""
+
+        if require_certificate:
+            return self.judge_completion_certificate(
+                requirement=requirement,
+                acceptance_criteria=acceptance_criteria,
+                evidence=evidence,
+                iteration=iteration,
+                max_iterations=max_iterations,
+                agent_requested_stop=agent_requested_stop,
+                domain=domain,
+                timeout=timeout,
+            )
 
         goal = self.judge_goal_completion(
             requirement=requirement,
@@ -918,6 +975,15 @@ class JevClient:
             agent_requested_stop=agent_requested_stop,
             timeout=timeout,
         )
+        certificate = domain_gate.get("completion_certificate")
+        if require_certificate and (
+            not isinstance(certificate, Mapping)
+            or not isinstance(certificate.get("status"), str)
+            or not isinstance(certificate.get("claims"), list)
+        ):
+            raise JevDecisionError(
+                "JEV did not return a structured completion_certificate; legacy score response rejected"
+            )
         return {
             **domain_gate,
             "domain_confidence": goal["domain_confidence"],
@@ -926,4 +992,536 @@ class JevClient:
             "goal_confidence": goal["goal_completed"],
             "reason": domain_gate["reason"],
             "calls": ["goal_completion", "domain_stop"],
+        }
+
+    def judge_completion_certificate(
+        self,
+        *,
+        requirement: str,
+        acceptance_criteria: list[str],
+        evidence: list[dict[str, Any]],
+        iteration: int,
+        max_iterations: int,
+        agent_requested_stop: bool,
+        domain: str | None = None,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        """Ask JEV to define standards, then ask it to evaluate each standard."""
+
+        compact_evidence = self._compact_evidence(evidence)
+        domain_result = self._resolve_completion_domain(
+            requirement=requirement,
+            domain=domain,
+            evidence=compact_evidence,
+            iteration=iteration,
+            timeout=timeout,
+        )
+        resolved_domain = domain_result["domain"]
+        standard_options = [
+            {"id": "goal", "text": requirement, "category": "goal"},
+            *[
+                {"id": f"criterion_{index}", "text": criterion, "category": "user_acceptance"}
+                for index, criterion in enumerate(acceptance_criteria)
+            ],
+            *self._domain_completion_standards(resolved_domain),
+        ]
+        standard_catalog = self._define_completion_standards(
+            requirement=requirement,
+            candidates=standard_options,
+            domain=resolved_domain,
+            evidence=compact_evidence,
+            iteration=iteration,
+            timeout=timeout,
+        )
+        claims = standard_catalog["standards"]
+        if standard_catalog["status"] != "defined":
+            if standard_catalog["status"] == "needs_clarification" and iteration < max_iterations:
+                standard_status = "continue"
+                standard_reason = "completion_standards_need_clarification"
+            elif standard_catalog["status"] == "needs_clarification":
+                standard_status = "escalate"
+                standard_reason = "iteration_limit"
+            else:
+                standard_status = "escalate"
+                standard_reason = "no_verifiable_completion_standard"
+            clarification_cause = standard_catalog.get("clarification_cause", "none")
+            cause_detail = {
+                "input_unreadable": "The supplied requirement text appears corrupted or incomplete.",
+                "goal_ambiguous": "The requested outcome has multiple plausible meanings.",
+                "scope_unclear": "The scope or boundary of the requested work is unclear.",
+                "conflicting_requirements": "The requirement clauses conflict with each other.",
+                "missing_success_condition": "A necessary success condition is not specified.",
+                "no_verifiable_outcome": "The requested outcome has no observable confirmation.",
+            }.get(clarification_cause, "JEV could not form a reliable completion standard set.")
+            if standard_reason == "iteration_limit":
+                cause_detail = "The iteration limit was reached while JEV still could not establish completion standards."
+            certificate = {
+                "status": standard_status,
+                "domain": resolved_domain,
+                "confidence": standard_catalog["confidence"],
+                "domain_confidence": domain_result["confidence"],
+                "standards": claims,
+                "claims": [],
+                "contradictions": [],
+                "reason_code": standard_reason,
+                "clarification_cause": clarification_cause,
+                "reason_detail": cause_detail,
+                "reason": f"JEV could not establish completion standards: {standard_reason}; cause={clarification_cause}. {cause_detail}",
+            }
+            return {
+                "status": standard_status,
+                "confidence": standard_catalog["confidence"],
+                "missing": [standard_reason],
+                "domain": resolved_domain,
+                "domain_confidence": domain_result["confidence"],
+                "goal_completed": False,
+                "goal_confidence": standard_catalog["confidence"],
+                "completion_certificate": certificate,
+                "reason": certificate["reason"],
+                "calls": ["completion_domain", "completion_standards"] + (["completion_standards_clarification"] if clarification_cause != "none" else []),
+            }
+        if not claims:
+            raise JevDecisionError("JEV could not define any verifiable completion standards")
+        next_evidence_options = [
+            "none", "requirement_confirmation", "implementation_diff", "targeted_test",
+            "full_test_suite", "build_or_lint", "runtime_validation", "tool_output", "user_confirmation",
+        ]
+        questions: dict[str, Any] = {
+            "certificate_status": {
+                "type": "choice",
+                "options": ["stop", "continue", "escalate"],
+                "criteria": {"stop": "all required claims satisfied", "continue": "one or more claims incomplete", "escalate": "judgment cannot be made reliably"},
+                "instructions": "Select stop only when every required claim is satisfied and no contradiction exists.",
+            },
+            "certificate_confidence": {
+                "type": "noul",
+                "instructions": "Score confidence in this completion certificate from 0 to 1.",
+            },
+        }
+        reason_codes = ["goal_incomplete", "missing_claim", "insufficient_evidence", "contradiction", "uncertain", "iteration_limit"]
+        for reason_code in reason_codes:
+            questions[f"reason_{reason_code}"] = {
+                "type": "noul",
+                "instructions": f"Score how strongly this is the primary reason the completion certificate cannot authorize stop: {reason_code}.",
+            }
+        for claim in claims:
+            claim_evidence_options = self._completion_evidence_options(
+                claim=claim,
+                domain=resolved_domain,
+                evidence=compact_evidence,
+            )
+            questions[f"claim_status_{claim['id']}"] = {
+                "type": "choice",
+                "options": ["satisfied", "unsatisfied", "unverifiable", "not_applicable"],
+                "criteria": {"satisfied": "evidence supports the claim", "unsatisfied": "claim is not met", "unverifiable": "evidence is insufficient", "not_applicable": "claim does not apply"},
+                "instructions": f"Classify whether this required claim is supported: {claim['text']}",
+            }
+            questions[f"claim_evidence_{claim['id']}"] = {
+                "type": "choice",
+                "options": claim_evidence_options,
+                "criteria": {option: ("no eligible supporting evidence" if option == "NONE" else f"eligible {claim['id']} evidence record {option} supports the claim") for option in claim_evidence_options},
+                "instructions": "Select one exact evidence ID from this claim's eligible evidence only, or NONE. Do not select an assistant completion statement as proof of implementation or validation.",
+            }
+            questions[f"claim_evidence_status_{claim['id']}"] = {
+                "type": "choice",
+                "options": ["none", "sufficient", "missing", "weak", "irrelevant", "contradictory"],
+                "criteria": {
+                    "none": "no evidence is needed for this claim",
+                    "sufficient": "the cited evidence directly verifies this claim",
+                    "missing": "required evidence is absent",
+                    "weak": "evidence exists but does not adequately verify the claim",
+                    "irrelevant": "the cited evidence does not support this claim",
+                    "contradictory": "evidence conflicts with this claim",
+                },
+                "instructions": "Classify the evidence sufficiency for this claim using only the cited evidence ID.",
+            }
+            questions[f"claim_next_evidence_{claim['id']}"] = {
+                "type": "choice",
+                "options": next_evidence_options,
+                "criteria": {
+                    "none": "no additional evidence is needed",
+                    "requirement_confirmation": "confirm the exact requirement or acceptance criteria",
+                    "implementation_diff": "inspect the relevant implementation diff",
+                    "targeted_test": "run a test targeted at this claim",
+                    "full_test_suite": "run the complete relevant test suite",
+                    "build_or_lint": "run build, type check, or lint validation",
+                    "runtime_validation": "perform a runtime or integration validation",
+                    "tool_output": "collect authoritative output from the relevant tool",
+                    "user_confirmation": "ask the user to confirm an inherently subjective result",
+                },
+                "instructions": "Select the next evidence type that would most directly resolve this claim's evidence gap.",
+            }
+        response = self.decide(
+            state={
+                "requirement": requirement,
+                "acceptance_criteria": acceptance_criteria,
+                "completion_standards": claims,
+                "evidence": compact_evidence,
+                "completion_evidence_candidates": {
+                    claim["id"]: self._completion_evidence_options(
+                        claim=claim,
+                        domain=resolved_domain,
+                        evidence=compact_evidence,
+                    )
+                    for claim in claims
+                },
+                "domain_hint": resolved_domain,
+                "iteration": iteration,
+                "max_iterations": max_iterations,
+                "agent_requested_stop": agent_requested_stop,
+            },
+            questions=questions,
+            operation="completion_certificate_evaluate",
+            timeout=timeout,
+        )
+        answers = response["answers"]
+
+        def choice(key: str, options: list[str]) -> str:
+            value = answers.get(key, {}).get("choice") if isinstance(answers.get(key), Mapping) else None
+            if value not in options:
+                raise JevDecisionError(f"JEV certificate choice {key} was invalid")
+            return value
+
+        status = choice("certificate_status", ["stop", "continue", "escalate"])
+        confidence = self._noul_score(answers, "certificate_confidence")
+        reason_scores = {code: self._noul_score(answers, f"reason_{code}") for code in reason_codes}
+        reason_code = "none" if status == "stop" else max(reason_scores, key=reason_scores.get)
+        certificate_claims = []
+        missing = []
+        for claim in claims:
+            claim_status = choice(
+                f"claim_status_{claim['id']}",
+                ["satisfied", "unsatisfied", "unverifiable", "not_applicable"],
+            )
+            evidence_id = choice(
+                f"claim_evidence_{claim['id']}",
+                self._completion_evidence_options(
+                    claim=claim,
+                    domain=resolved_domain,
+                    evidence=compact_evidence,
+                ),
+            )
+            evidence_status = choice(
+                f"claim_evidence_status_{claim['id']}",
+                ["none", "sufficient", "missing", "weak", "irrelevant", "contradictory"],
+            )
+            next_evidence = choice(f"claim_next_evidence_{claim['id']}", next_evidence_options)
+            refs = [] if evidence_id == "NONE" else [evidence_id]
+            certificate_claims.append({"id": claim["id"], "status": claim_status, "evidence_ids": refs, "evidence_status": evidence_status, "next_evidence": next_evidence})
+            if claim_status in {"unsatisfied", "unverifiable"} or evidence_status in {"missing", "weak", "irrelevant", "contradictory"} or (claim_status == "satisfied" and not refs):
+                missing.append(claim["id"])
+        if status == "continue" and iteration >= max_iterations:
+            status = "escalate"
+            missing.append("iteration_limit")
+            reason_code = "iteration_limit"
+        evidence_gaps = [
+            f"{claim['id']}:{claim['evidence_status']}"
+            + (f"[{','.join(claim['evidence_ids'])}]" if claim["evidence_ids"] else "")
+            + (f"=>{claim['next_evidence']}" if claim["next_evidence"] != "none" else "")
+            for claim in certificate_claims
+            if claim["evidence_status"] in {"missing", "weak", "irrelevant", "contradictory"}
+        ]
+        evidence_gap_detail = f" Evidence gaps: {', '.join(evidence_gaps)}." if evidence_gaps else ""
+        standard_results = "; ".join(f"{claim['id']}={claim['status']}" for claim in certificate_claims)
+        standard_result_detail = f" Standards: {standard_results}." if standard_results else ""
+        reason_detail = {
+            "none": "No blocking reason; completion was authorized.",
+            "goal_incomplete": "The overall goal is not complete.",
+            "missing_claim": "One or more required claims are not satisfied.",
+            "insufficient_evidence": "The available evidence is insufficient to verify completion.",
+            "contradiction": "The evidence contains a contradiction.",
+            "uncertain": "JEV is not confident enough to authorize stopping.",
+            "iteration_limit": "The iteration limit prevents continuing safely.",
+        }[reason_code]
+        if status != "stop" and reason_code == "none":
+            reason_code = "uncertain"
+            reason_detail = "JEV did not authorize stopping and supplied no more specific blocking reason."
+        return {
+            "status": status,
+            "confidence": confidence,
+            "missing": missing,
+            "domain": resolved_domain,
+            "domain_confidence": domain_result["confidence"],
+            "goal_completed": not missing,
+            "goal_confidence": confidence,
+            "completion_certificate": {
+                "status": status,
+                "domain": resolved_domain,
+                "confidence": confidence,
+                "domain_confidence": domain_result["confidence"],
+                "standards": claims,
+                "claims": certificate_claims,
+                "contradictions": [],
+                "reason_code": reason_code,
+                "reason_detail": reason_detail,
+                "reason": (
+                    f"JEV typed completion certificate selected {status}; reason_code={reason_code}. {reason_detail}"
+                    + standard_result_detail
+                    + evidence_gap_detail
+                    + (f" Missing or unverifiable claims: {', '.join(missing)}." if missing else "")
+                    + (" The certificate did not authorize stopping." if status != "stop" else "")
+                ),
+            },
+            "reason": (
+                f"JEV typed completion certificate selected {status}; reason_code={reason_code}. {reason_detail}"
+                + standard_result_detail
+                + evidence_gap_detail
+                + (f" Missing or unverifiable claims: {', '.join(missing)}." if missing else "")
+                + (" The certificate did not authorize stopping." if status != "stop" else "")
+            ),
+            "calls": ["completion_domain", "completion_standards", "completion_certificate_evaluate"],
+        }
+
+    @staticmethod
+    def _domain_completion_standards(domain: str) -> list[dict[str, str]]:
+        catalog = {
+            "implementation": [
+                {"id": "impl_change_evidenced", "text": "The requested code or behavior change is present and evidenced.", "category": "implementation_contract"},
+                {"id": "impl_validation_passed", "text": "Applicable tests or validation support the requested implementation result.", "category": "implementation_contract"},
+            ],
+            "documentation": [
+                {"id": "docs_artifact_complete", "text": "The requested documentation or text artifact is complete and evidenced.", "category": "documentation_contract"},
+            ],
+            "information": [
+                {"id": "info_question_answered", "text": "The response directly answers the user's question.", "category": "information_contract"},
+            ],
+            "investigation": [
+                {"id": "investigation_finding_supported", "text": "The investigation has a finding supported by collected evidence.", "category": "investigation_contract"},
+            ],
+            "configuration": [
+                {"id": "configuration_applied", "text": "The requested configuration is applied and evidenced.", "category": "configuration_contract"},
+            ],
+            "external_action": [
+                {"id": "external_action_confirmed", "text": "The requested external action has a recorded result or confirmation.", "category": "external_action_contract"},
+            ],
+        }
+        return list(catalog.get(normalize_task_domain(domain), []))
+
+    @staticmethod
+    def _completion_evidence_options(
+        *,
+        claim: Mapping[str, Any],
+        domain: str,
+        evidence: list[dict[str, Any]],
+    ) -> list[str]:
+        """Limit each certificate claim to evidence kinds that can support it.
+
+        This is input construction, not a completion decision: JEV still
+        decides whether an eligible record actually supports the claim. In
+        particular, an unverified assistant response must not be selectable
+        as proof that an implementation changed or passed validation.
+        """
+
+        normalized_domain = normalize_task_domain(domain)
+        claim_id = str(claim.get("id") or "")
+        if normalized_domain == "implementation":
+            eligible_kinds = {
+                "goal": {"requirement", "user_request", "acceptance_criteria", "git_diff", "test_result", "runtime", "build_failure"},
+                "impl_change_evidenced": {"git_diff", "test_result", "runtime", "build_failure"},
+                "impl_validation_passed": {"test_result", "runtime"},
+            }.get(claim_id, {"git_diff", "test_result", "runtime", "build_failure"})
+        elif normalized_domain == "information":
+            eligible_kinds = {"requirement", "user_request", "acceptance_criteria", "final_acceptance"}
+        elif normalized_domain == "documentation":
+            eligible_kinds = {"git_diff", "runtime", "final_acceptance"}
+        elif normalized_domain == "investigation":
+            eligible_kinds = {
+                "goal": {"requirement", "user_request", "acceptance_criteria"},
+                "investigation_finding_supported": {"log", "runtime", "test_result", "build_failure"},
+            }.get(claim_id, {"log", "runtime", "test_result", "build_failure"})
+        elif normalized_domain == "external_action":
+            eligible_kinds = {"runtime", "log", "final_acceptance"}
+        else:
+            eligible_kinds = {"git_diff", "test_result", "runtime", "build_failure", "log"}
+
+        ids = [
+            str(item["id"])
+            for item in evidence
+            if (
+                item.get("id")
+                and str(item.get("kind")) in eligible_kinds
+                and JevClient._is_validation_evidence(item)
+            )
+        ]
+        return ["NONE", *ids]
+
+    @staticmethod
+    def _is_validation_evidence(item: Mapping[str, Any]) -> bool:
+        """Reject validation labels unsupported by the recorded command."""
+
+        if str(item.get("kind")) != "test_result":
+            return True
+        # Import lazily: importing a submodule of ``decision`` at module load
+        # time executes decision/__init__.py, whose metrics imports JevClient.
+        from .decision.prescreen import BUILD_COMMAND_RE, TEST_COMMAND_RE
+
+        content = item.get("content")
+        if not isinstance(content, Mapping):
+            return False
+        command = str(content.get("command") or "")
+        if TEST_COMMAND_RE.match(command):
+            return True
+        return bool(content.get("validation") == "build" and BUILD_COMMAND_RE.match(command))
+
+    def _resolve_completion_domain(
+        self,
+        *,
+        requirement: str,
+        domain: str | None,
+        evidence: list[dict[str, Any]],
+        iteration: int,
+        timeout: float | None,
+    ) -> dict[str, Any]:
+        hint = normalize_task_domain(domain)
+        options = [hint] if hint != "unknown" else list(TASK_DOMAINS[:-1])
+        response = self.decide(
+            state={"requirement": requirement, "domain_hint": hint, "evidence": evidence, "iteration": iteration},
+            questions={
+                "completion_domain": {
+                    "type": "choice",
+                    "options": options,
+                    "criteria": {item: f"the requested outcome follows the {item} completion contract" for item in options},
+                    "instructions": "Select the single task domain that best describes the user's requested outcome.",
+                },
+                "completion_domain_confidence": {
+                    "type": "noul",
+                    "instructions": "Score confidence in the selected task domain from 0 to 1.",
+                },
+            },
+            operation="completion_domain",
+            timeout=timeout,
+        )
+        answers = response["answers"]
+        answer = answers.get("completion_domain")
+        selected = answer.get("choice") if isinstance(answer, Mapping) else None
+        if selected not in options:
+            raise JevDecisionError("JEV completion domain choice was invalid")
+        return {"domain": selected, "confidence": self._noul_score(answers, "completion_domain_confidence")}
+
+    def _define_completion_standards(
+        self,
+        *,
+        requirement: str,
+        candidates: list[dict[str, str]],
+        domain: str | None,
+        evidence: list[dict[str, Any]],
+        iteration: int,
+        timeout: float | None,
+    ) -> dict[str, Any]:
+        """Have JEV select which supplied requirement clauses are completion standards."""
+        resolved_domain = normalize_task_domain(domain)
+        questions: dict[str, Any] = {
+            "standard_set_status": {
+                "type": "choice",
+                "options": ["defined", "needs_clarification", "no_verifiable_standard"],
+                "criteria": {
+                    "defined": "the user's goal plus the selected domain baseline and any supplied acceptance clauses form a usable minimum completion standard set",
+                    "needs_clarification": "even with the selected domain baseline, an essential outcome or boundary cannot be determined",
+                    "no_verifiable_standard": "the request has no objectively or user-confirmable completion standard",
+                },
+                "instructions": (
+                    "Decide whether the supplied candidates define a usable minimum standard set. "
+                    "Do not request clarification merely because the user supplied no separate acceptance criteria: "
+                    "the user's goal plus the selected domain baseline are the default minimum standards. "
+                    "Use needs_clarification only if an essential result or scope boundary remains indeterminate."
+                ),
+            },
+            "standard_confidence": {
+                "type": "noul",
+                "instructions": "Score confidence that the selected candidates form the right completion standard set.",
+            },
+        }
+        for candidate in candidates:
+            if candidate["id"] == "goal":
+                continue
+            key = f"standard_required_{candidate['id']}"
+            questions[key] = {
+                "type": "choice",
+                "options": ["required", "optional", "not_applicable"],
+                "criteria": {
+                    "required": "completion must satisfy this clause",
+                    "optional": "useful but not required to satisfy the user's request",
+                    "not_applicable": "this clause is not part of the task's completion conditions",
+                },
+                "instructions": (
+                f"Classify whether this clause is a required completion standard for the {resolved_domain} task: "
+                    f"[{candidate['id']}] {candidate['text']}"
+                ),
+            }
+        response = self.decide(
+            state={
+                "requirement": requirement,
+                "standard_candidates": candidates,
+                "domain": resolved_domain,
+                "evidence": evidence,
+                "iteration": iteration,
+            },
+            questions=questions,
+            operation="completion_standards",
+            timeout=timeout,
+        )
+        answers = response["answers"]
+
+        def choice(key: str, options: list[str]) -> str:
+            item = answers.get(key)
+            value = item.get("choice") if isinstance(item, Mapping) else None
+            if value not in options:
+                raise JevDecisionError(f"JEV completion standard answer {key} was invalid")
+            return value
+
+        status = choice("standard_set_status", ["defined", "needs_clarification", "no_verifiable_standard"])
+        clarification_cause = "none"
+        if status != "defined":
+            cause_options = [
+                "input_unreadable", "goal_ambiguous", "scope_unclear",
+                "conflicting_requirements", "missing_success_condition", "no_verifiable_outcome",
+            ]
+            cause_response = self.decide(
+                state={
+                    "requirement": requirement,
+                    "standard_candidates": candidates,
+                    "standard_set_status": status,
+                    "domain": resolved_domain,
+                    "evidence": evidence,
+                    "iteration": iteration,
+                },
+                questions={
+                    "standard_clarification_cause": {
+                        "type": "choice",
+                        "options": cause_options,
+                        "criteria": {
+                            "input_unreadable": "the supplied requirement text is corrupted, incomplete, or unreadable",
+                            "goal_ambiguous": "the requested outcome has multiple plausible meanings",
+                            "scope_unclear": "the included work or boundaries are unclear",
+                            "conflicting_requirements": "requirements or acceptance criteria conflict",
+                            "missing_success_condition": "a necessary condition for deciding success is absent",
+                            "no_verifiable_outcome": "the requested outcome has no observable or confirmable result",
+                        },
+                        "instructions": "Select the primary reason the completion standard set cannot be finalized. Choose exactly one cause.",
+                    }
+                },
+                operation="completion_standards_clarification",
+                timeout=timeout,
+            )
+            cause_answer = cause_response["answers"].get("standard_clarification_cause")
+            clarification_cause = cause_answer.get("choice") if isinstance(cause_answer, Mapping) else None
+            if clarification_cause not in cause_options:
+                raise JevDecisionError("JEV clarification cause answer was invalid")
+        confidence = self._noul_score(answers, "standard_confidence")
+        standards = []
+        for candidate in candidates:
+            if candidate["id"] == "goal":
+                standards.append({**candidate, "classification": "required"})
+                continue
+            classification = choice(f"standard_required_{candidate['id']}", ["required", "optional", "not_applicable"])
+            if classification == "required":
+                standards.append({**candidate, "classification": classification})
+        if status == "defined" and not standards:
+            raise JevDecisionError("JEV marked completion standards defined but selected none")
+        return {
+            "status": status,
+            "domain": resolved_domain,
+            "confidence": confidence,
+            "standards": standards,
+            "clarification_cause": clarification_cause,
         }

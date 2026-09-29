@@ -1,5 +1,5 @@
 {
-  "description": "Decision-Driven Agent project lifecycle hooks using the repository decision layer and JEV configuration.",
+  "description": "Decision-Driven Agent lifecycle hooks (without the Stop gate).",
   "hooks": {
     "UserPromptSubmit": [
       {
@@ -38,19 +38,6 @@
             "commandWindows": "for /f \"delims=\" %i in ('git rev-parse --show-toplevel') do @python -u \"%i\\.codex\\hooks\\decision_agent_hook.py\"",
             "timeout": 15,
             "statusMessage": "Recording execution evidence"
-          }
-        ]
-      }
-    ],
-    "Stop": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python -u \"$(git rev-parse --show-toplevel)/.codex/hooks/decision_agent_hook.py\"",
-            "commandWindows": "for /f \"delims=\" %i in ('git rev-parse --show-toplevel') do @python -u \"%i\\.codex\\hooks\\decision_agent_hook.py\"",
-            "timeout": 45,
-            "statusMessage": "Checking completion evidence"
           }
         ]
       }

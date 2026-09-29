@@ -218,6 +218,8 @@ class StopDecision:
     source: str = "local"
     fallback: bool = False
     fallback_reason: str = ""
+    completion_standards: list[dict[str, Any]] = field(default_factory=list)
+    standard_results: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -233,6 +235,8 @@ class StopDecision:
             "source": self.source,
             "fallback": self.fallback,
             "fallback_reason": self.fallback_reason,
+            "completion_standards": list(self.completion_standards),
+            "standard_results": list(self.standard_results),
         }
 
 

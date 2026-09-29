@@ -797,6 +797,42 @@ class SufficiencyTests(unittest.TestCase):
         self.assertEqual(result["domain"], "information")
         self.assertEqual(result["domain_confidence"], 0.9)
 
+    def test_unknown_score_does_not_override_concrete_domain_evidence(self):
+        domain_answers = {
+            f"domain_{name}": {"noul": 0.08}
+            for name in (
+                "implementation",
+                "documentation",
+                "information",
+                "investigation",
+                "configuration",
+                "external_action",
+            )
+        }
+        domain_answers["domain_implementation"] = {"noul": 0.58}
+        domain_answers["domain_unknown"] = {"noul": 0.92}
+        client = JevClient(
+            api_key="test-key",
+            opener=lambda request, timeout=None: self._JsonResponse(
+                {"answers": {"goal_completed": {"noul": 0.9}, **domain_answers}}
+            ),
+        )
+
+        result = client.judge_goal_completion(
+            requirement="Implement login",
+            acceptance_criteria=["valid login returns a token"],
+            evidence=[
+                {"kind": "git_diff", "content": "src/auth.py adds login handling"},
+                {"kind": "test_result", "content": "login test passed"},
+            ],
+            domain=None,
+            iteration=0,
+            agent_requested_stop=True,
+        )
+
+        self.assertEqual(result["domain"], "implementation")
+        self.assertEqual(result["domain_confidence"], 0.58)
+
     def test_escalate_score_controls_the_iteration_limit(self):
         def result_for(score):
             client = JevClient(
@@ -829,6 +865,74 @@ class SufficiencyTests(unittest.TestCase):
 
 
 class JevEvidenceCompactionTests(unittest.TestCase):
+    def test_investigation_goal_uses_requirement_and_finding_uses_tool_output(self):
+        evidence = [
+            {"kind": "requirement", "id": "goal-requirement"},
+            {"kind": "user_request", "id": "goal-prompt"},
+            {"kind": "log", "id": "observed-tool-output"},
+            {"kind": "runtime", "id": "runtime-observation"},
+            {"kind": "final_acceptance", "id": "assistant-claim"},
+        ]
+
+        goal_options = JevClient._completion_evidence_options(
+            claim={"id": "goal"},
+            domain="investigation",
+            evidence=evidence,
+        )
+        finding_options = JevClient._completion_evidence_options(
+            claim={"id": "investigation_finding_supported"},
+            domain="investigation",
+            evidence=evidence,
+        )
+
+        self.assertIn("goal-requirement", goal_options)
+        self.assertIn("goal-prompt", goal_options)
+        self.assertNotIn("observed-tool-output", goal_options)
+        self.assertIn("observed-tool-output", finding_options)
+        self.assertIn("runtime-observation", finding_options)
+        self.assertNotIn("assistant-claim", finding_options)
+
+    def test_compaction_preserves_recent_tool_logs(self):
+        evidence = [
+            {"kind": "log", "id": f"log-{index}", "content": {"stdout": f"observation-{index}"}}
+            for index in range(8)
+        ] + [
+            {"kind": "decision", "id": f"decision-{index}", "content": "x"}
+            for index in range(14)
+        ]
+
+        compact = JevClient._compact_evidence(evidence)
+        compact_ids = {item["id"] for item in compact}
+
+        self.assertTrue({"log-5", "log-6", "log-7"} <= compact_ids)
+
+    def test_implementation_claims_exclude_unverified_assistant_response(self):
+        evidence = [
+            {"kind": "final_acceptance", "id": "assistant-answer"},
+            {"kind": "git_diff", "id": "source-diff"},
+            {"kind": "test_result", "id": "test-run", "content": {"command": "python -m unittest"}},
+            {"kind": "test_result", "id": "search-result", "content": {"command": "rg 'Ran 188 tests'"}},
+            {"kind": "runtime", "id": "runtime-check"},
+        ]
+        change_options = JevClient._completion_evidence_options(
+            claim={"id": "impl_change_evidenced"},
+            domain="implementation",
+            evidence=evidence,
+        )
+        validation_options = JevClient._completion_evidence_options(
+            claim={"id": "impl_validation_passed"},
+            domain="implementation",
+            evidence=evidence,
+        )
+
+        self.assertNotIn("assistant-answer", change_options)
+        self.assertNotIn("assistant-answer", validation_options)
+        self.assertNotIn("search-result", validation_options)
+        self.assertIn("source-diff", change_options)
+        self.assertIn("test-run", validation_options)
+        self.assertIn("runtime-check", validation_options)
+        self.assertNotIn("source-diff", validation_options)
+
     def test_completion_claim_survives_compaction(self):
         claim = "\u4e2d\u6587" * 100 + "CONCLUSION-MARKER"
         compact = JevClient._compact_evidence(

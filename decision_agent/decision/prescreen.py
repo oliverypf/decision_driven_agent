@@ -15,10 +15,11 @@ from typing import Any, Mapping
 
 
 TEST_COMMAND_RE = re.compile(
-    r"(?:\bpytest\b|\bunittest\b|\bnpm\s+(?:run\s+)?test\b|\byarn\s+test\b|"
-    r"\bpnpm\s+(?:run\s+)?test\b|\bcargo\s+test\b|\bgo\s+test\b|\bdotnet\s+test\b|"
-    r"\bmvn\s+test\b|\bgradle\s+test\b|\bjest\b|\bvitest\b|\bmocha\b|\btox\b|"
-    r"\bnox\b|\brspec\b|\bphpunit\b|\bctest\b)",
+    r"^\s*(?:(?:python(?:\d(?:\.\d+)*)?|py)\s+-m\s+(?:pytest|unittest)\b|"
+    r"pytest\b|unittest\b|npm\s+(?:run\s+)?test\b|yarn\s+test\b|"
+    r"pnpm\s+(?:run\s+)?test\b|cargo\s+test\b|go\s+test\b|dotnet\s+test\b|"
+    r"mvn\s+test\b|gradle\s+test\b|jest\b|vitest\b|mocha\b|tox\b|"
+    r"nox\b|rspec\b|phpunit\b|ctest\b)",
     re.IGNORECASE,
 )
 BUILD_COMMAND_RE = re.compile(
@@ -121,6 +122,17 @@ def prescreen_tool_result(
     """Classify one tool result locally and flag cases that need JEV."""
 
     signals: list[str] = []
+    if is_read_only_command_chain(command):
+        signals.append("command:read_only_inspection")
+        failed = exit_code not in (None, 0)
+        return ToolResultPreScreen(
+            kind="other",
+            failed=failed,
+            confidence=0.95,
+            signals=signals + ([f"exit_code:{exit_code}"] if failed else []),
+            needs_model=False,
+            reason="Read-only inspection output is logged but is not validation evidence.",
+        )
     if TEST_COMMAND_RE.search(command):
         kind, kind_confidence = "test_result", 0.92
         signals.append("command:test_runner")
@@ -171,7 +183,12 @@ def prescreen_tool_result(
 
     needs_model = False
     reason = ""
-    if failed is None and is_execution:
+    # An unclassified command with no error signal is ordinary execution
+    # telemetry, not a useful model decision. Keep it local. JEV remains
+    # involved for validation/runtime results and error interpretation.
+    if failed is None and is_execution and (
+        kind != "other" or "marker:weak" in signals or "response:error_field" in signals
+    ):
         needs_model = True
         reason = "The failure signal is weak and the exit code is unknown."
     elif failed and kind == "other":
@@ -322,13 +339,74 @@ def _has_shell_chain(command: str) -> bool:
     return bool(re.search(r"(?:&&|\|\||[;&\r\n])", command))
 
 
+def _split_unquoted_shell_stages(command: str) -> list[str]:
+    """Split simple shell operators without splitting quoted search patterns."""
+
+    stages: list[str] = []
+    current: list[str] = []
+    quote: str | None = None
+    escaped = False
+    index = 0
+    while index < len(command):
+        char = command[index]
+        if escaped:
+            current.append(char)
+            escaped = False
+            index += 1
+            continue
+        if char == "\\" and quote != "'":
+            current.append(char)
+            escaped = True
+            index += 1
+            continue
+        if quote:
+            current.append(char)
+            if char == quote:
+                quote = None
+            index += 1
+            continue
+        if char in {"'", '"'}:
+            quote = char
+            current.append(char)
+            index += 1
+            continue
+        if char in "|;&\r\n":
+            if index + 1 < len(command) and command[index:index + 2] in {"&&", "||"}:
+                index += 2
+            else:
+                index += 1
+            stages.append("".join(current).strip())
+            current = []
+            continue
+        current.append(char)
+        index += 1
+    if quote:
+        return []
+    stages.append("".join(current).strip())
+    return stages
+
+
 def _is_read_only_command(command: str) -> bool:
     """Return whether a command or every stage of its pipeline is read-only."""
 
-    parts = [part.strip() for part in command.split("|")]
+    parts = _split_unquoted_shell_stages(command)
     if not parts or any(not part for part in parts):
         return False
     return all(READ_ONLY_COMMAND_RE.search(part) for part in parts)
+
+
+def is_read_only_command_chain(command: str) -> bool:
+    """Return whether every simple stage in a shell chain is read-only.
+
+    Inspection output may quote historical test results. Never ask JEV to
+    classify that output as a current validation run.
+    """
+
+    text = command.strip()
+    if not text or any(marker in text for marker in ("$(", "`", ">", "<")):
+        return False
+    parts = _split_unquoted_shell_stages(text)
+    return bool(parts) and all(part.strip() and _is_read_only_command(part.strip()) for part in parts)
 
 
 @dataclass(frozen=True)

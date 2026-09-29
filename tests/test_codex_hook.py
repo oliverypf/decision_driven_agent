@@ -17,6 +17,17 @@ class CodexHookTests(unittest.TestCase):
     def tearDown(self):
         self._env_patch.stop()
 
+    def test_status_question_is_low_information_after_particle_normalization(self):
+        self.assertEqual(codex_hook._normalized_reply("现在可以了吧"), "现在可以")
+        self.assertTrue(codex_hook._is_low_information("现在可以了吧"))
+
+    def test_contextual_how_to_pass_question_inherits_the_active_goal(self):
+        self.assertTrue(codex_hook._is_low_information("怎样才能通过呢"))
+        self.assertTrue(codex_hook._is_low_information("怎么才能通过呢"))
+
+    def test_relocate_and_stop_status_question_inherits_active_goal(self):
+        self.assertTrue(codex_hook._is_low_information("再定位一下，可以stop了吗"))
+
     def _prompt(self, root: str, *, session: str = "session-1", turn: str = "turn-1") -> dict:
         return handle_hook(
             {
@@ -121,6 +132,34 @@ class CodexHookTests(unittest.TestCase):
             self.assertIn("为登录接口添加失败重试并运行单元测试", state["requirement"])
             self.assertEqual(state["requirement"].count("[The user replied only"), 1)
 
+    def test_relocate_and_stop_question_carries_previous_requirement(self):
+        with tempfile.TemporaryDirectory() as root:
+            handle_hook(
+                {
+                    "hook_event_name": "UserPromptSubmit",
+                    "session_id": "session-1",
+                    "turn_id": "turn-1",
+                    "cwd": root,
+                    "prompt": "核实 Stop hook 为什么没有授权结束，并定位可验证的证据缺口",
+                },
+                root_dir=root,
+            )
+            handle_hook(
+                {
+                    "hook_event_name": "UserPromptSubmit",
+                    "session_id": "session-1",
+                    "turn_id": "turn-2",
+                    "cwd": root,
+                    "prompt": "再定位一下，可以stop了吗",
+                },
+                root_dir=root,
+            )
+            state = json.loads(
+                Path(root, ".decision", "sessions", "session-1.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(state["requirement_source"], "carried")
+            self.assertIn("核实 Stop hook 为什么没有授权结束", state["requirement"])
+
     def test_informative_prompt_is_recorded_verbatim(self):
         with tempfile.TemporaryDirectory() as root:
             self._prompt(root)
@@ -129,6 +168,50 @@ class CodexHookTests(unittest.TestCase):
             )
             self.assertEqual(state["requirement"], "Implement login")
             self.assertEqual(state["requirement_source"], "prompt")
+
+    def test_stop_recovers_requirement_when_state_was_reset_to_uninitialized(self):
+        with tempfile.TemporaryDirectory() as root:
+            self._prompt(root)
+            state_path = Path(root, ".decision", "sessions", "session-1.json")
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            state.update({
+                "requirement": "",
+                "task_id": "uninitialized",
+                "evidence_dir": str(Path(root, ".decision", "evidence", "session-1", "uninitialized")),
+            })
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+
+            handle_hook(
+                {"hook_event_name": "Stop", "session_id": "session-1", "turn_id": "turn-1"},
+                root_dir=root,
+            )
+
+            recovered = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(recovered["requirement"], "Implement login")
+            self.assertNotEqual(recovered["task_id"], "uninitialized")
+
+    def test_stop_state_recovery_escapes_unmatched_windows_surrogates(self):
+        with tempfile.TemporaryDirectory() as root:
+            self._prompt(root)
+            state_path = Path(root, ".decision", "sessions", "session-1.json")
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            state.update({
+                "requirement": "",
+                "task_id": "uninitialized",
+                "evidence_dir": str(Path(root, ".decision", "evidence", "session-1", "uninitialized")),
+            })
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+            original = codex_hook._recent_requirement
+            try:
+                codex_hook._recent_requirement = lambda *args: ("broken \udc80 requirement", "test")
+                codex_hook._current_task(
+                    {"session_id": "session-1", "turn_id": "turn-1"},
+                    Path(root),
+                )
+            finally:
+                codex_hook._recent_requirement = original
+            saved = state_path.read_text(encoding="utf-8")
+            self.assertIn("\\udc80", saved)
 
     def _write_packet(self, root: str, turn: str, goal: str) -> None:
         packet = Path(root, ".decision", "evidence", "session-1", turn, "decision-space.json")
@@ -710,7 +793,7 @@ class CodexHookJevRoutingTests(unittest.TestCase):
             self.assertEqual(len(fake.evidence_requests), 1)
             self.assertEqual(fake.failure_requests, [])
 
-    def test_tool_evidence_fallback_preserves_the_reason(self):
+    def test_unclassified_ordinary_output_stays_local_without_jev(self):
         with tempfile.TemporaryDirectory() as root:
             fake = _FakeJevClient(evidence_answer={})
             self._prompt(root)
@@ -728,15 +811,12 @@ class CodexHookJevRoutingTests(unittest.TestCase):
                 )
 
             classifications = [
-                record["content"]["tool_evidence"]
-                for record in self._records(root)
+                record for record in self._records(root)
                 if record["kind"] == "decision"
                 and "tool_evidence" in record.get("content", {})
             ]
-            self.assertTrue(classifications)
-            self.assertEqual(classifications[-1]["source"], "local_fallback")
-            self.assertTrue(classifications[-1]["fallback"])
-            self.assertIn("Invalid JEV tool-evidence response", classifications[-1]["fallback_reason"])
+            self.assertEqual(classifications, [])
+            self.assertEqual(fake.evidence_requests, [])
 
     def test_invalid_jev_failure_type_is_never_adopted(self):
         with tempfile.TemporaryDirectory() as root:
