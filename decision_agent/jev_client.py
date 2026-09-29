@@ -91,6 +91,13 @@ class JevClient:
         self._opener = opener
         self._last_call: dict[str, Any] | None = None
         self._call_history: list[dict[str, Any]] = []
+        self.problem_context: dict[str, Any] = {}
+
+    def set_problem_context(self, *, problem_id: str, problem_statement: str) -> None:
+        self.problem_context = {
+            "problem_id": str(problem_id),
+            "problem_statement": str(problem_statement)[:4000],
+        }
 
     @staticmethod
     def _config_string(config: Mapping[str, Any], key: str) -> str | None:
@@ -342,7 +349,10 @@ class JevClient:
             self.note_unavailable(operation)
             raise JevDecisionError("JEV_API_KEY is not configured")
         effective_timeout = self.timeout if timeout is None else max(0.5, float(timeout))
-        payload = self._sanitize({"model": self.model, "state": dict(state), "questions": dict(questions)})
+        request_state = dict(state)
+        if self.problem_context:
+            request_state["problem"] = dict(self.problem_context)
+        payload = self._sanitize({"model": self.model, "state": request_state, "questions": dict(questions)})
         request_chars = len(json.dumps(payload, ensure_ascii=True, default=str))
         request_digest = hashlib.sha256(
             json.dumps(payload, ensure_ascii=True, sort_keys=True, default=str).encode("utf-8")

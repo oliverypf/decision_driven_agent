@@ -9,6 +9,7 @@ inherit an earlier task's validation records.
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 import sys
 from pathlib import Path
@@ -21,6 +22,11 @@ from .models import FAILURE_TYPES, EvidenceKind, FailureRoute
 
 
 _SAFE_ID_RE = re.compile(r"[^A-Za-z0-9_.-]+")
+
+
+def _problem_id(requirement: str) -> str:
+    digest = hashlib.sha256(requirement.strip().encode("utf-8", "replace")).hexdigest()[:16]
+    return f"problem-{digest}"
 
 # A prompt such as "要", "继续" or "ok" confirms the current goal without
 # restating it. The raw reply is still recorded, but the effective requirement
@@ -160,6 +166,8 @@ def _default_state(root: Path, session_id: str) -> dict[str, Any]:
         "session_id": session_id,
         "task_id": "uninitialized",
         "requirement": "",
+        "problem_id": "",
+        "problem_statement": "",
         "prompt": "",
         "requirement_source": "prompt",
         "carried_from": "",
@@ -319,6 +327,8 @@ def _start_task(
         "session_id": session_id,
         "task_id": turn_id,
         "requirement": requirement,
+        "problem_id": _problem_id(requirement),
+        "problem_statement": requirement,
         "prompt": prompt,
         "requirement_source": "carried" if carried_from else "prompt",
         "carried_from": carried_from,
@@ -329,7 +339,9 @@ def _start_task(
         "model": payload.get("model"),
     }
     controller = DecisionController.from_directory(evidence_dir, jev_timeout=jev_timeout)
-    controller.set_trace_context(session_id=session_id, turn_id=turn_id)
+    controller.set_trace_context(session_id=session_id, turn_id=turn_id,
+                                 problem_id=state["problem_id"],
+                                 problem_statement=state["problem_statement"])
     provenance = {
         "session_id": session_id,
         "turn_id": turn_id,
@@ -401,6 +413,8 @@ def _current_task(
     controller.set_trace_context(
         session_id=session_id,
         turn_id=str(payload.get("turn_id") or state.get("task_id") or "uninitialized"),
+        problem_id=str(state.get("problem_id") or _problem_id(str(state.get("requirement") or ""))),
+        problem_statement=str(state.get("problem_statement") or state.get("requirement") or ""),
     )
     return controller, state
 

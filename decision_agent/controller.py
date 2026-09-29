@@ -24,6 +24,7 @@ from .models import (
 )
 from .jev_client import JevClient
 from .decision.routers import MemoryDecision, ModelRouter, TestSelector, ToolRouter, RoutingDecision
+from .decision.development import DevelopmentPlanner
 
 
 class DecisionController:
@@ -39,16 +40,23 @@ class DecisionController:
         self.tool_router = ToolRouter()
         self.test_selector = TestSelector()
         self.memory_decision = MemoryDecision()
+        self.development_planner = DevelopmentPlanner(self.jev_client)
         self._audited_jev_calls = 0
         self.trace_context: dict[str, Any] = {}
 
-    def set_trace_context(self, *, session_id: str | None = None, turn_id: str | None = None) -> None:
+    def set_trace_context(self, *, session_id: str | None = None, turn_id: str | None = None,
+                          problem_id: str | None = None, problem_statement: str | None = None) -> None:
         """Set lifecycle identifiers to attach to every persisted JEV audit."""
 
         self.trace_context = {
             "session_id": str(session_id or "") or None,
             "turn_id": str(turn_id or "") or None,
+            "problem_id": str(problem_id or "") or None,
+            "problem_statement": str(problem_statement or "")[:4000] or None,
         }
+        setter = getattr(self.jev_client, "set_problem_context", None)
+        if problem_id and problem_statement and callable(setter):
+            setter(problem_id=str(problem_id), problem_statement=str(problem_statement))
 
     @classmethod
     def from_directory(
@@ -68,7 +76,11 @@ class DecisionController:
         severity: str = "info",
         metadata: dict[str, Any] | None = None,
     ) -> EvidenceRecord:
-        return self.store.append(kind, content, severity=severity, metadata=metadata)
+        enriched = dict(metadata or {})
+        for key in ("problem_id", "problem_statement"):
+            if self.trace_context.get(key) and key not in enriched:
+                enriched[key] = self.trace_context[key]
+        return self.store.append(kind, content, severity=severity, metadata=enriched)
 
     def evidence(self) -> list[EvidenceRecord]:
         return self.store.read_all()
@@ -565,6 +577,31 @@ class DecisionController:
 
     def decide_memory(self, candidates, *, state=None, timeout=None) -> RoutingDecision:
         return self._route(self.memory_decision, candidates, state=state, timeout=timeout)
+
+    def plan_development(self, stage: str, *, problem: Mapping[str, Any], candidates: Iterable[Mapping[str, Any]],
+                         evidence: Iterable[Mapping[str, Any]] = (), timeout: float | None = None) -> dict[str, Any]:
+        """Choose one evidence-bound development step and persist the decision."""
+
+        chooser = {
+            "next_action": self.development_planner.choose_next_action,
+            "files": self.development_planner.choose_files,
+            "direction": self.development_planner.choose_direction,
+            "verification": self.development_planner.choose_verification,
+        }.get(stage)
+        if chooser is None:
+            raise ValueError(f"unknown development planning stage: {stage}")
+        result = chooser(problem=dict(problem), candidates=list(candidates), evidence=list(evidence), timeout=timeout)
+        self.record_evidence(EvidenceKind.DECISION, {"development_plan": result}, metadata={"decision": result["operation"], "source": result["source"]})
+        return result
+
+    def verify_development_execution(self, *, problem: Mapping[str, Any], selected_files: Iterable[str],
+                                     changed_files: Iterable[str], validation_evidence: Iterable[Mapping[str, Any]] = ()) -> dict[str, Any]:
+        result = self.development_planner.verify_execution(
+            problem=dict(problem), selected_files=list(selected_files), changed_files=list(changed_files),
+            validation_evidence=list(validation_evidence),
+        )
+        self.record_evidence(EvidenceKind.VALIDATION, {"development_verification": result}, metadata={"decision": "modification_verification", "source": result["source"]})
+        return result
 
     def _route(self, router, candidates, *, state, timeout):
         decision = router.decide(candidates=candidates, client=self.jev_client, state=state, timeout=timeout)

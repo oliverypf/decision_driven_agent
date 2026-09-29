@@ -97,6 +97,7 @@ class EvidenceKind(str, Enum):
     SECURITY_RISK = "security_risk"
     BUILD_FAILURE = "build_failure"
     FINAL_ACCEPTANCE = "final_acceptance"
+    VALIDATION = "validation"
 
 
 class RetentionPolicy(str, Enum):

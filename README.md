@@ -62,6 +62,42 @@ JEV connection defaults can be changed in a project-root `jev.config.json` (copy
 
 ## Efficiency routers
 
+## Evidence-bound development loop
+
+开发任务可以按以下顺序调用 `development-plan`，每次只让 JEV 从有限候选中选择一个结果：
+
+1. `next_action`：选择下一步动作；
+2. `files`：选择允许修改的文件；
+3. `direction`：选择修改方向；
+4. `verification`：选择验证方案。
+
+每个候选项必须包含 `id`、`action` 和已有证据的 `evidence_ids`。请求中的 `problem` 必须包含完整的
+`problem_id` 与 `problem_statement`，JEV 会在每个阶段收到同一问题上下文和相关证据。JEV 不负责直接改文件或执行命令；
+Codex/脚本执行选中的候选后，调用 `development-verify` 检查实际改动是否越出选定文件范围，并确认验证证据绑定同一问题。
+JEV 不可用时会显式返回 `source=local_fallback` 和 `fallback_reason`，不会伪装成 JEV 结论。
+
+示例：
+
+```powershell
+python -m decision_agent development-plan .\development-plan.json
+python -m decision_agent development-verify .\development-verify.json
+```
+
+`development-plan.json` 的核心结构为：
+
+```json
+{
+  "stage": "files",
+  "problem": {"problem_id": "problem-123", "problem_statement": "修复认证失败"},
+  "candidates": [
+    {"id": "client", "action": "修复请求认证头", "path": "decision_agent/jev_client.py", "evidence_ids": ["e1"]}
+  ],
+  "evidence": [{"id": "e1", "kind": "error", "content": "401 Missing Authentication header"}]
+}
+```
+
+`development-verify.json` 需要提供 `problem`、`selected_files`、`changed_files` 和 `validation_evidence`。
+
 The repository includes first-pass routing decisions for reducing wasted model and tool calls:
 
 - `ModelRouter`: choose between model candidates.
